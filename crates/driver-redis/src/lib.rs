@@ -213,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_connection() {
-        let config = ConnectionConfig {
+        let config = driver_api::ConnectionConfig {
             id: "test".to_string(),
             host: "invalid_host_123456789".to_string(),
             port: 6379,
