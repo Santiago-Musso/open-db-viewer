@@ -60,7 +60,8 @@ mod implementation {
     fn write_store(store: &HashMap<String, String>) -> Result<(), String> {
         let serialized = serde_json::to_string(store).map_err(|e| e.to_string())?;
         let mut file = File::create(get_file_path()).map_err(|e| e.to_string())?;
-        file.write_all(serialized.as_bytes()).map_err(|e| e.to_string())?;
+        file.write_all(serialized.as_bytes())
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -72,7 +73,10 @@ mod implementation {
 
     pub fn get_db_password(conn_id: &str) -> Result<String, String> {
         let store = read_store();
-        store.get(conn_id).cloned().ok_or_else(|| "No entry".to_string())
+        store
+            .get(conn_id)
+            .cloned()
+            .ok_or_else(|| "No entry".to_string())
     }
 
     pub fn delete_db_password(conn_id: &str) -> Result<(), String> {

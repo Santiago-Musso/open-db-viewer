@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use dashmap::DashMap;
-use driver_api::{ConnectionConfig, RelationalDriver, KeyValueDriver};
+use driver_api::{ConnectionConfig, KeyValueDriver, RelationalDriver};
 use driver_postgres::PostgresDriver;
 use driver_redis::RedisDriver;
+use std::sync::Arc;
 
 pub enum ActiveConnection {
     Relational(Arc<dyn RelationalDriver>),
@@ -24,19 +24,29 @@ impl ConnectionManager {
         match driver_id {
             "postgres" => {
                 let driver = PostgresDriver::connect(config).await?;
-                self.connections.insert(config.id.clone(), ActiveConnection::Relational(Arc::new(driver)));
+                self.connections.insert(
+                    config.id.clone(),
+                    ActiveConnection::Relational(Arc::new(driver)),
+                );
                 Ok(())
             }
             "redis" => {
                 let driver = RedisDriver::connect(config).await?;
-                self.connections.insert(config.id.clone(), ActiveConnection::KeyValue(Arc::new(driver)));
+                self.connections.insert(
+                    config.id.clone(),
+                    ActiveConnection::KeyValue(Arc::new(driver)),
+                );
                 Ok(())
             }
             _ => Err(format!("Unsupported driver: {}", driver_id)),
         }
     }
 
-    pub async fn test_connection(&self, driver_id: &str, config: &ConnectionConfig) -> Result<(), String> {
+    pub async fn test_connection(
+        &self,
+        driver_id: &str,
+        config: &ConnectionConfig,
+    ) -> Result<(), String> {
         match driver_id {
             "postgres" => {
                 let _driver = PostgresDriver::connect(config).await?;
@@ -49,7 +59,6 @@ impl ConnectionManager {
             _ => Err(format!("Unsupported driver: {}", driver_id)),
         }
     }
-
 
     pub fn disconnect(&self, connection_id: &str) -> Result<(), String> {
         if self.connections.remove(connection_id).is_some() {

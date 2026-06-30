@@ -1,7 +1,7 @@
 use async_trait::async_trait;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
-use futures_util::Stream;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DriverKind {
@@ -11,7 +11,7 @@ pub enum DriverKind {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DriverManifest {
-    pub id: String,           // "postgres" | "redis"
+    pub id: String, // "postgres" | "redis"
     pub kind: DriverKind,
     pub display_name: String,
     pub default_port: u16,
@@ -115,7 +115,12 @@ pub struct ServerInfo {
 
 #[async_trait]
 pub trait KeyValueDriver: Send + Sync {
-    async fn scan_keys(&self, pattern: &str, cursor: u64, count: usize) -> Result<ScanResult, String>;
+    async fn scan_keys(
+        &self,
+        pattern: &str,
+        cursor: u64,
+        count: usize,
+    ) -> Result<ScanResult, String>;
     async fn get_key(&self, key: &str) -> Result<KeyValue, String>;
     async fn set_key(&self, key: &str, value: &str, ttl: Option<i64>) -> Result<(), String>;
     async fn delete_key(&self, key: &str) -> Result<(), String>;

@@ -19,10 +19,16 @@ impl RedisDriver {
         };
 
         let client = redis::Client::open(conn_str).map_err(|e| e.to_string())?;
-        
+
         // Test connection immediately
-        let mut conn = client.get_async_connection().await.map_err(|e| e.to_string())?;
-        let _: String = redis::cmd("PING").query_async(&mut conn).await.map_err(|e| e.to_string())?;
+        let mut conn = client
+            .get_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let _: String = redis::cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
 
         Ok(Self { client })
     }
@@ -30,8 +36,17 @@ impl RedisDriver {
 
 #[async_trait]
 impl KeyValueDriver for RedisDriver {
-    async fn scan_keys(&self, pattern: &str, cursor: u64, count: usize) -> Result<ScanResult, String> {
-        let mut conn = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
+    async fn scan_keys(
+        &self,
+        pattern: &str,
+        cursor: u64,
+        count: usize,
+    ) -> Result<ScanResult, String> {
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
         let mut cmd = redis::cmd("SCAN");
         cmd.arg(cursor);
         if !pattern.is_empty() {
@@ -41,7 +56,10 @@ impl KeyValueDriver for RedisDriver {
             cmd.arg("COUNT").arg(count);
         }
 
-        let (next_cursor, keys): (u64, Vec<String>) = cmd.query_async(&mut conn).await.map_err(|e| e.to_string())?;
+        let (next_cursor, keys): (u64, Vec<String>) = cmd
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
 
         Ok(ScanResult {
             cursor: next_cursor,
@@ -50,32 +68,69 @@ impl KeyValueDriver for RedisDriver {
     }
 
     async fn get_key(&self, key: &str) -> Result<KeyValue, String> {
-        let mut conn = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
-        let val_type: String = redis::cmd("TYPE").arg(key).query_async(&mut conn).await.map_err(|e| e.to_string())?;
-        
-        let ttl: i64 = redis::cmd("TTL").arg(key).query_async(&mut conn).await.map_err(|e| e.to_string())?;
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let val_type: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
         let ttl_opt = if ttl >= 0 { Some(ttl) } else { None };
 
         let value = match val_type.as_str() {
             "none" => return Err("Key does not exist".to_string()),
             "string" => {
-                let val: String = redis::cmd("GET").arg(key).query_async(&mut conn).await.map_err(|e| e.to_string())?;
+                let val: String = redis::cmd("GET")
+                    .arg(key)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 val
             }
             "hash" => {
-                let val: HashMap<String, String> = redis::cmd("HGETALL").arg(key).query_async(&mut conn).await.map_err(|e| e.to_string())?;
+                let val: HashMap<String, String> = redis::cmd("HGETALL")
+                    .arg(key)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
             }
             "list" => {
-                let val: Vec<String> = redis::cmd("LRANGE").arg(key).arg(0).arg(-1).query_async(&mut conn).await.map_err(|e| e.to_string())?;
+                let val: Vec<String> = redis::cmd("LRANGE")
+                    .arg(key)
+                    .arg(0)
+                    .arg(-1)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string())
             }
             "set" => {
-                let val: Vec<String> = redis::cmd("SMEMBERS").arg(key).query_async(&mut conn).await.map_err(|e| e.to_string())?;
+                let val: Vec<String> = redis::cmd("SMEMBERS")
+                    .arg(key)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string())
             }
             "zset" => {
-                let val: Vec<(String, f64)> = redis::cmd("ZRANGE").arg(key).arg(0).arg(-1).arg("WITHSCORES").query_async(&mut conn).await.map_err(|e| e.to_string())?;
+                let val: Vec<(String, f64)> = redis::cmd("ZRANGE")
+                    .arg(key)
+                    .arg(0)
+                    .arg(-1)
+                    .arg("WITHSCORES")
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 serde_json::to_string_pretty(&val).unwrap_or_else(|_| "[]".to_string())
             }
             _ => {
@@ -92,8 +147,12 @@ impl KeyValueDriver for RedisDriver {
     }
 
     async fn set_key(&self, key: &str, value: &str, ttl: Option<i64>) -> Result<(), String> {
-        let mut conn = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
-        
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
         let mut cmd = redis::cmd("SET");
         cmd.arg(key).arg(value);
         if let Some(t) = ttl {
@@ -101,20 +160,37 @@ impl KeyValueDriver for RedisDriver {
                 cmd.arg("EX").arg(t);
             }
         }
-        cmd.query_async::<_, ()>(&mut conn).await.map_err(|e| e.to_string())?;
+        cmd.query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     async fn delete_key(&self, key: &str) -> Result<(), String> {
-        let mut conn = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
-        let _: i64 = redis::cmd("DEL").arg(key).query_async(&mut conn).await.map_err(|e| e.to_string())?;
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let _: i64 = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     async fn server_info(&self) -> Result<ServerInfo, String> {
-        let mut conn = self.client.get_async_connection().await.map_err(|e| e.to_string())?;
-        let info_str: String = redis::cmd("INFO").query_async(&mut conn).await.map_err(|e| e.to_string())?;
-        
+        let mut conn = self
+            .client
+            .get_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let info_str: String = redis::cmd("INFO")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let mut stats = HashMap::new();
         for line in info_str.lines() {
             if line.starts_with('#') || line.trim().is_empty() {

@@ -1,12 +1,15 @@
-mod state;
 mod keychain;
 mod productivity;
+mod state;
 
+use driver_api::{
+    ConnectionConfig, KeyValue, ScanResult, SchemaGraph, SchemaInfo, ServerInfo, TableInfo,
+    TableSchema,
+};
 use state::AppState;
-use driver_api::{ConnectionConfig, SchemaInfo, TableInfo, TableSchema, SchemaGraph, ScanResult, KeyValue, ServerInfo};
-use tauri::{Emitter, Window, State, Manager};
 use std::fs::File;
 use std::io::{Read, Write};
+use tauri::{Emitter, Manager, State, Window};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct ConnectionProfile {
@@ -31,7 +34,13 @@ fn get_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String>
 }
 
 fn resolve_config_password(mut config: ConnectionConfig) -> ConnectionConfig {
-    if config.password.is_none() || config.password.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+    if config.password.is_none()
+        || config
+            .password
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    {
         if let Ok(pwd) = keychain::get_db_password(&config.id) {
             config.password = Some(pwd);
         }
@@ -50,20 +59,19 @@ async fn connect_db(
 }
 
 #[tauri::command]
-fn disconnect_db(
-    state: State<'_, AppState>,
-    connection_id: String,
-) -> Result<(), String> {
+fn disconnect_db(state: State<'_, AppState>, connection_id: String) -> Result<(), String> {
     state.manager.disconnect(&connection_id)
 }
-
 
 #[tauri::command]
 async fn list_schemas(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> Result<Vec<SchemaInfo>, String> {
-    println!("DEBUG: list_schemas called for connection: {}", connection_id);
+    println!(
+        "DEBUG: list_schemas called for connection: {}",
+        connection_id
+    );
     let driver = state.manager.get_relational(&connection_id)?;
     let res = driver.list_schemas().await;
     println!("DEBUG: list_schemas result: {:?}", res);
@@ -122,7 +130,9 @@ async fn execute_query(
     batch_size: usize,
 ) -> Result<(), String> {
     let driver = state.manager.get_relational(&connection_id)?;
-    let mut stream = driver.execute_query_stream(&query_id, &sql, batch_size).await?;
+    let mut stream = driver
+        .execute_query_stream(&query_id, &sql, batch_size)
+        .await?;
 
     tokio::spawn(async move {
         use futures_util::StreamExt;
@@ -179,7 +189,10 @@ async fn test_connection(
     config: ConnectionConfig,
 ) -> Result<(), String> {
     let resolved_config = resolve_config_password(config);
-    state.manager.test_connection(&driver_id, &resolved_config).await
+    state
+        .manager
+        .test_connection(&driver_id, &resolved_config)
+        .await
 }
 
 #[tauri::command]
@@ -200,7 +213,8 @@ async fn save_connection_profile(
     let mut profiles: Vec<ConnectionProfile> = if path.exists() {
         let mut file = File::open(&path).map_err(|e| e.to_string())?;
         let mut contents = String::new();
-        file.read_to_string(&mut contents).map_err(|e| e.to_string())?;
+        file.read_to_string(&mut contents)
+            .map_err(|e| e.to_string())?;
         serde_json::from_str(&contents).unwrap_or_else(|_| vec![])
     } else {
         vec![]
@@ -222,7 +236,8 @@ async fn save_connection_profile(
 
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
     let serialized = serde_json::to_string_pretty(&profiles).map_err(|e| e.to_string())?;
-    file.write_all(serialized.as_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(serialized.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -238,8 +253,10 @@ async fn load_connection_profiles(
 
     let mut file = File::open(&path).map_err(|e| e.to_string())?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents).map_err(|e| e.to_string())?;
-    let profiles: Vec<ConnectionProfile> = serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
+    file.read_to_string(&mut contents)
+        .map_err(|e| e.to_string())?;
+    let profiles: Vec<ConnectionProfile> =
+        serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
 
     let mut response = vec![];
     for p in profiles {
@@ -255,12 +272,8 @@ async fn load_connection_profiles(
     Ok(response)
 }
 
-
 #[tauri::command]
-async fn delete_connection_profile(
-    app: tauri::AppHandle,
-    id: String,
-) -> Result<(), String> {
+async fn delete_connection_profile(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let _ = keychain::delete_db_password(&id);
 
     let path = get_config_path(&app)?;
@@ -270,14 +283,17 @@ async fn delete_connection_profile(
 
     let mut file = File::open(&path).map_err(|e| e.to_string())?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents).map_err(|e| e.to_string())?;
-    let mut profiles: Vec<ConnectionProfile> = serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
+    file.read_to_string(&mut contents)
+        .map_err(|e| e.to_string())?;
+    let mut profiles: Vec<ConnectionProfile> =
+        serde_json::from_str(&contents).unwrap_or_else(|_| vec![]);
 
     profiles.retain(|p| p.config.id != id);
 
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
     let serialized = serde_json::to_string_pretty(&profiles).map_err(|e| e.to_string())?;
-    file.write_all(serialized.as_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(serialized.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -371,4 +387,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

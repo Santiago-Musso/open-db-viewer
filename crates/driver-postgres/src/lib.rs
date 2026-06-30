@@ -1,15 +1,15 @@
 use async_trait::async_trait;
 use driver_api::{
-    ColumnInfo, ConnectionConfig, RelationalDriver, RowBatch, SchemaEdge, SchemaGraph,
-    SchemaInfo, SchemaNode, TableInfo, TableSchema,
+    ColumnInfo, ConnectionConfig, RelationalDriver, RowBatch, SchemaEdge, SchemaGraph, SchemaInfo,
+    SchemaNode, TableInfo, TableSchema,
 };
+use futures_util::Stream;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
-use futures_util::Stream;
 
 pub struct PostgresDriver {
     client: Arc<Client>,
@@ -57,7 +57,10 @@ impl PostgresDriver {
 struct RawValue<'a>(&'a [u8]);
 
 impl<'a> tokio_postgres::types::FromSql<'a> for RawValue<'a> {
-    fn from_sql(_ty: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(
+        _ty: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         Ok(RawValue(raw))
     }
 
@@ -71,63 +74,49 @@ fn pg_value_to_json(row: &tokio_postgres::Row, index: usize) -> serde_json::Valu
     let ty = col.type_();
 
     match *ty {
-        tokio_postgres::types::Type::BOOL => {
-            match row.try_get::<_, Option<bool>>(index) {
-                Ok(Some(val)) => serde_json::Value::Bool(val),
-                _ => serde_json::Value::Null,
-            }
-        }
-        tokio_postgres::types::Type::INT2 => {
-            match row.try_get::<_, Option<i16>>(index) {
-                Ok(Some(val)) => serde_json::Value::Number(val.into()),
-                _ => serde_json::Value::Null,
-            }
-        }
-        tokio_postgres::types::Type::INT4 => {
-            match row.try_get::<_, Option<i32>>(index) {
-                Ok(Some(val)) => serde_json::Value::Number(val.into()),
-                _ => serde_json::Value::Null,
-            }
-        }
-        tokio_postgres::types::Type::INT8 => {
-            match row.try_get::<_, Option<i64>>(index) {
-                Ok(Some(val)) => serde_json::Value::Number(val.into()),
-                _ => serde_json::Value::Null,
-            }
-        }
-        tokio_postgres::types::Type::FLOAT4 => {
-            match row.try_get::<_, Option<f32>>(index) {
-                Ok(Some(val)) => {
-                    if let Some(n) = serde_json::Number::from_f64(val as f64) {
-                        serde_json::Value::Number(n)
-                    } else {
-                        serde_json::Value::Null
-                    }
+        tokio_postgres::types::Type::BOOL => match row.try_get::<_, Option<bool>>(index) {
+            Ok(Some(val)) => serde_json::Value::Bool(val),
+            _ => serde_json::Value::Null,
+        },
+        tokio_postgres::types::Type::INT2 => match row.try_get::<_, Option<i16>>(index) {
+            Ok(Some(val)) => serde_json::Value::Number(val.into()),
+            _ => serde_json::Value::Null,
+        },
+        tokio_postgres::types::Type::INT4 => match row.try_get::<_, Option<i32>>(index) {
+            Ok(Some(val)) => serde_json::Value::Number(val.into()),
+            _ => serde_json::Value::Null,
+        },
+        tokio_postgres::types::Type::INT8 => match row.try_get::<_, Option<i64>>(index) {
+            Ok(Some(val)) => serde_json::Value::Number(val.into()),
+            _ => serde_json::Value::Null,
+        },
+        tokio_postgres::types::Type::FLOAT4 => match row.try_get::<_, Option<f32>>(index) {
+            Ok(Some(val)) => {
+                if let Some(n) = serde_json::Number::from_f64(val as f64) {
+                    serde_json::Value::Number(n)
+                } else {
+                    serde_json::Value::Null
                 }
-                _ => serde_json::Value::Null,
             }
-        }
-        tokio_postgres::types::Type::FLOAT8 => {
-            match row.try_get::<_, Option<f64>>(index) {
-                Ok(Some(val)) => {
-                    if let Some(n) = serde_json::Number::from_f64(val) {
-                        serde_json::Value::Number(n)
-                    } else {
-                        serde_json::Value::Null
-                    }
+            _ => serde_json::Value::Null,
+        },
+        tokio_postgres::types::Type::FLOAT8 => match row.try_get::<_, Option<f64>>(index) {
+            Ok(Some(val)) => {
+                if let Some(n) = serde_json::Number::from_f64(val) {
+                    serde_json::Value::Number(n)
+                } else {
+                    serde_json::Value::Null
                 }
-                _ => serde_json::Value::Null,
             }
-        }
+            _ => serde_json::Value::Null,
+        },
         tokio_postgres::types::Type::VARCHAR
         | tokio_postgres::types::Type::TEXT
         | tokio_postgres::types::Type::BPCHAR
-        | tokio_postgres::types::Type::NAME => {
-            match row.try_get::<_, Option<String>>(index) {
-                Ok(Some(val)) => serde_json::Value::String(val),
-                _ => serde_json::Value::Null,
-            }
-        }
+        | tokio_postgres::types::Type::NAME => match row.try_get::<_, Option<String>>(index) {
+            Ok(Some(val)) => serde_json::Value::String(val),
+            _ => serde_json::Value::Null,
+        },
         tokio_postgres::types::Type::JSON | tokio_postgres::types::Type::JSONB => {
             match row.try_get::<_, Option<serde_json::Value>>(index) {
                 Ok(Some(val)) => val,
@@ -140,7 +129,9 @@ fn pg_value_to_json(row: &tokio_postgres::Row, index: usize) -> serde_json::Valu
                     Some(val) => serde_json::Value::String(val.to_string()),
                     None => serde_json::Value::Null,
                 }
-            } else if let Ok(val_opt) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(index) {
+            } else if let Ok(val_opt) =
+                row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(index)
+            {
                 match val_opt {
                     Some(val) => serde_json::Value::String(val.to_string()),
                     None => serde_json::Value::Null,
@@ -159,12 +150,10 @@ fn pg_value_to_json(row: &tokio_postgres::Row, index: usize) -> serde_json::Valu
                 serde_json::Value::String("<date>".to_string())
             }
         }
-        tokio_postgres::types::Type::UUID => {
-            match row.try_get::<_, Option<uuid::Uuid>>(index) {
-                Ok(Some(val)) => serde_json::Value::String(val.to_string()),
-                _ => serde_json::Value::Null,
-            }
-        }
+        tokio_postgres::types::Type::UUID => match row.try_get::<_, Option<uuid::Uuid>>(index) {
+            Ok(Some(val)) => serde_json::Value::String(val.to_string()),
+            _ => serde_json::Value::Null,
+        },
         tokio_postgres::types::Type::NUMERIC => {
             match row.try_get::<_, Option<rust_decimal::Decimal>>(index) {
                 Ok(Some(val)) => serde_json::to_value(val).unwrap_or(serde_json::Value::Null),
