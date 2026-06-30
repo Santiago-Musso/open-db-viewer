@@ -4,7 +4,17 @@ Open DB Viewer is a premium, mac-first, secure desktop database client built usi
 
 ---
 
-## 1. Installation Process (macOS)
+## 📥 Download & Install
+
+You don't need to build from source! You can download the latest pre-compiled macOS installer (`.dmg`) directly from the **[GitHub Releases](https://github.com/Santiago-Musso/open-db-viewer/releases)** page.
+
+1. Go to the [Releases page](https://github.com/Santiago-Musso/open-db-viewer/releases).
+2. Download the `.dmg` file under the **Assets** dropdown for the latest version.
+3. Open the `.dmg` and drag the **Open DB Viewer** app into your Applications folder.
+
+---
+
+## 🛠️ Developer Setup (Build from Source)
 
 ### Prerequisites
 Make sure you have Rust and Node.js installed on your Mac.
