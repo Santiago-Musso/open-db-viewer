@@ -1,0 +1,12 @@
+[package]
+name = "driver-redis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+driver-api = { path = "../driver-api" }
+redis = { version = "0.24", features = ["tokio-comp"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
