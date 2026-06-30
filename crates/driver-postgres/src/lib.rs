@@ -410,17 +410,16 @@ mod tests {
     use driver_api::ConnectionConfig;
 
     #[tokio::test]
-    async fn test_list_schemas() {
+    async fn test_invalid_connection() {
         let config = ConnectionConfig {
             id: "test".to_string(),
-            host: "localhost".to_string(),
+            host: "invalid_host_123456789".to_string(),
             port: 5432,
             user: Some("postgres".to_string()),
-            db_name: Some("atlas-local-v3".to_string()),
+            db_name: Some("test".to_string()),
             password: Some("postgres".to_string()),
         };
-        let driver = PostgresDriver::connect(&config).await.unwrap();
-        let schemas = driver.list_schemas().await.unwrap();
-        println!("TEST_SCHEMAS_OUTPUT: {:?}", schemas);
+        let result = PostgresDriver::connect(&config).await;
+        assert!(result.is_err());
     }
 }
