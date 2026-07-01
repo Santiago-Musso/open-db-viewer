@@ -3,6 +3,7 @@
   import { EditorState, Compartment } from "@codemirror/state";
   import { EditorView, keymap, lineNumbers } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+  import { autocompletion } from "@codemirror/autocomplete";
   import { sql, PostgreSQL } from "@codemirror/lang-sql";
   import { appState } from "../state.svelte";
 
@@ -38,6 +39,7 @@
       extensions: [
         lineNumbers(),
         history(),
+        autocompletion(),
         sqlCompartment.of(sql({ dialect: PostgreSQL, schema: cmSchema })),
         keymap.of([
           ...defaultKeymap,
