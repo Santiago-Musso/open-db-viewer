@@ -149,17 +149,61 @@
     return appState.schemaEdges.find(e => e.source_handle === colName);
   }
 
-  function navigateFk(colName: string, cellValue: any) {
+  // Reverse FK Context Menu Logic
+  let fkMenu = $state({
+    isOpen: false,
+    x: 0,
+    y: 0,
+    edges: [] as any[],
+    cellValue: null as any
+  });
+
+  function closeFkMenu() {
+    fkMenu.isOpen = false;
+  }
+
+  function getReverseFkEdges(colName: string) {
+    if (!appState.schemaEdges) return [];
+    
+    const currentTable = getCurrentTable();
+    if (!currentTable) return [];
+    
+    // Find all edges where the current table is the target (inbound edges)
+    return appState.schemaEdges.filter(e => 
+      e.target === currentTable && e.target_handle === colName
+    );
+  }
+
+  function navigateFk(event: MouseEvent, colName: string, cellValue: any) {
     if (!cellValue) return;
+    
+    // Prioritize outbound direct link first
     const edge = getFkEdge(colName);
     if (edge) {
       const query = `SELECT * FROM ${edge.target} WHERE ${edge.target_handle} = '${cellValue}';`;
       appState.openNewTab(query, true);
+      return;
+    }
+    
+    // Check for reverse inbound links
+    const reverseEdges = getReverseFkEdges(colName);
+    if (reverseEdges.length > 0) {
+      fkMenu.edges = reverseEdges;
+      fkMenu.cellValue = cellValue;
+      fkMenu.x = event.clientX;
+      fkMenu.y = event.clientY;
+      fkMenu.isOpen = true;
     }
   }
 
+  function navigateReverseFk(edge: any, cellValue: any) {
+    const query = `SELECT * FROM ${edge.source} WHERE ${edge.source_handle} = '${cellValue}';`;
+    appState.openNewTab(query, true);
+    closeFkMenu();
+  }
+
   function isFk(colName: string): boolean {
-    return !!getFkEdge(colName);
+    return !!getFkEdge(colName) || getReverseFkEdges(colName).length > 0;
   }
 </script>
 
@@ -200,7 +244,7 @@
             {#each rows[item.index] as cell, colIndex}
               <div class="data-cell" class:null-value={cell === null || cell === undefined}>
                 {#if isFk(columns[colIndex].name) && cell !== null && cell !== undefined}
-                  <button class="fk-link" onclick={() => navigateFk(columns[colIndex].name, cell)} title="Navigate to related row">
+                  <button class="fk-link" onclick={(e) => navigateFk(e, columns[colIndex].name, cell)} title="Navigate to related row">
                     {formatValue(cell)}
                   </button>
                 {:else if columns[colIndex].data_type.toLowerCase() === 'jsonb' || columns[colIndex].data_type.toLowerCase() === 'json'}
@@ -228,6 +272,26 @@
       </div>
       <div class="inspector-body">
         <pre>{JSON.stringify(inspectedJson, null, 2)}</pre>
+      </div>
+    </div>
+  {/if}
+
+  {#if fkMenu.isOpen}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="fk-backdrop" onclick={closeFkMenu}></div>
+    <div 
+      class="fk-menu" 
+      style="left: {fkMenu.x + 10}px; top: {fkMenu.y + 10}px;"
+    >
+      <div class="fk-menu-header">Navigate to related...</div>
+      <div class="fk-menu-list">
+        {#each fkMenu.edges as edge}
+          <button class="fk-menu-item" onclick={() => navigateReverseFk(edge, fkMenu.cellValue)}>
+            <span class="highlight">{edge.source}</span>
+            <span class="fk-hint">(via {edge.source_handle})</span>
+          </button>
+        {/each}
       </div>
     </div>
   {/if}
@@ -446,5 +510,75 @@
     color: var(--text-normal);
     white-space: pre-wrap;
     word-wrap: break-word;
+  }
+
+  .fk-backdrop {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 40;
+  }
+
+  .fk-menu {
+    position: fixed;
+    background-color: var(--bg-content);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    z-index: 50;
+    min-width: 220px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .fk-menu-header {
+    padding: 8px 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--text-muted);
+    background-color: var(--bg-app);
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .fk-menu-list {
+    display: flex;
+    flex-direction: column;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .fk-menu-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--border-color-light);
+    color: var(--text-normal);
+    cursor: pointer;
+    text-align: left;
+    font-size: 13px;
+    transition: background 0.15s;
+  }
+
+  .fk-menu-item:last-child {
+    border-bottom: none;
+  }
+
+  .fk-menu-item:hover {
+    background-color: var(--bg-app);
+  }
+
+  .highlight {
+    color: var(--color-primary);
+    font-weight: 500;
+  }
+
+  .fk-hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-left: 12px;
   }
 </style>
