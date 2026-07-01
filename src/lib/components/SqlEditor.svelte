@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { EditorState } from "@codemirror/state";
+  import { EditorState, Compartment } from "@codemirror/state";
   import { EditorView, keymap, lineNumbers } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-  import { sql } from "@codemirror/lang-sql";
+  import { sql, PostgreSQL } from "@codemirror/lang-sql";
+  import { appState } from "../state.svelte";
 
   interface Props {
     value: string;
@@ -15,6 +16,19 @@
 
   let container = $state<HTMLDivElement | null>(null);
   let view = $state<EditorView | null>(null);
+  
+  const sqlCompartment = new Compartment();
+
+  // Compute CodeMirror schema mapping from our global ER graph
+  let cmSchema = $derived.by(() => {
+    const s: Record<string, string[]> = {};
+    if (appState.schemaNodes) {
+      for (const node of appState.schemaNodes) {
+        s[node.id] = (node.columns || []).map((c: any) => c.name);
+      }
+    }
+    return s;
+  });
 
   onMount(() => {
     if (!container) return;
@@ -24,7 +38,7 @@
       extensions: [
         lineNumbers(),
         history(),
-        sql(),
+        sqlCompartment.of(sql({ dialect: PostgreSQL, schema: cmSchema })),
         keymap.of([
           ...defaultKeymap,
           ...historyKeymap,
@@ -66,6 +80,15 @@
     if (view && value !== view.state.doc.toString()) {
       view.dispatch({
         changes: { from: 0, to: view.state.doc.length, insert: value },
+      });
+    }
+  });
+
+  // Reactively reconfigure the SQL language plugin whenever the DB schema changes
+  $effect(() => {
+    if (view) {
+      view.dispatch({
+        effects: sqlCompartment.reconfigure(sql({ dialect: PostgreSQL, schema: cmSchema }))
       });
     }
   });

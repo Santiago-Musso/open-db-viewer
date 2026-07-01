@@ -32,7 +32,10 @@ class AppState {
   schemas = $state<{ name: string; tables?: { name: string; columns?: { name: string; data_type: string }[] }[] }[]>([]);
   tabs = $state<Tab[]>([]);
   activeTabId = $state<string | null>(null);
+  
+  // ER Diagram & Autocomplete data
   schemaEdges = $state<any[]>([]);
+  schemaNodes = $state<any[]>([]);
 
   // Redis specific state
   redisKeys = $state<string[]>([]);
@@ -237,6 +240,8 @@ class AppState {
     this.redisActiveKey = null;
     this.redisServerInfo = {};
     this.schemaEdges = [];
+    this.schemaNodes = [];
+    console.log("Global state reset completed.");
     this.saveSessionState();
   }
 
@@ -380,14 +385,15 @@ class AppState {
       this.schemas = list.map((s) => ({ name: s.name }));
       console.log("loadSchemas: set schemas to", this.schemas);
       
-      // Fetch schema graph for public to enable smart FK routing in the grid
+      // Fetch schema graph for public to enable smart FK routing in the grid and autocomplete
       try {
         const graph: any = await invoke("get_schema_graph", { 
           connectionId: this.activeConnectionId, 
           schema: "public" 
         });
-        if (graph && graph.edges) {
-          this.schemaEdges = graph.edges;
+        if (graph) {
+          if (graph.edges) this.schemaEdges = graph.edges;
+          if (graph.nodes) this.schemaNodes = graph.nodes;
         }
       } catch (e) {
         console.warn("Failed to load schema graph for FKs", e);
