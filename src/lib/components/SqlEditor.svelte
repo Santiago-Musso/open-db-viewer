@@ -3,7 +3,7 @@
   import { EditorState, Compartment } from "@codemirror/state";
   import { EditorView, keymap, lineNumbers } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-  import { autocompletion } from "@codemirror/autocomplete";
+  import { autocompletion, acceptCompletion } from "@codemirror/autocomplete";
   import { sql, PostgreSQL } from "@codemirror/lang-sql";
   import { appState } from "../state.svelte";
 
@@ -51,6 +51,10 @@
               return true;
             },
           },
+          {
+            key: "Tab",
+            run: acceptCompletion,
+          },
         ]),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
@@ -61,7 +65,18 @@
           "&": { height: "100%", fontSize: "13px", fontFamily: "'Fira Code', 'JetBrains Mono', Monaco, monospace" },
           ".cm-scroller": { overflow: "auto" },
           "&.cm-focused": { outline: "none" },
-          ".cm-gutters": { backgroundColor: "var(--bg-editor-gutter)", borderRight: "1px solid var(--border-color)" }
+          ".cm-gutters": { backgroundColor: "var(--bg-editor-gutter)", borderRight: "1px solid var(--border-color)" },
+          ".cm-tooltip.cm-tooltip-autocomplete": {
+            backgroundColor: "var(--bg-content)",
+            border: "1px solid var(--border-color)",
+            color: "var(--text-normal)",
+            borderRadius: "4px",
+            boxShadow: "0 4px 12px rgba(0,0,0,0.3)"
+          },
+          ".cm-tooltip-autocomplete > ul > li[aria-selected]": {
+            backgroundColor: "var(--color-primary)",
+            color: "#ffffff"
+          }
         })
       ],
     });
