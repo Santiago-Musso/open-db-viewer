@@ -12,6 +12,13 @@ You don't need to build from source! You can download the latest pre-compiled ma
 2. Download the `.dmg` file under the **Assets** dropdown for the latest version.
 3. Open the `.dmg` and drag the **Open DB Viewer** app into your Applications folder.
 
+> [!WARNING]
+> **macOS "App is damaged" Error:** Because this app is currently unsigned, macOS Gatekeeper may show an error saying the app is damaged and should be moved to the Trash. To fix this, open your Terminal and remove the quarantine attribute:
+> ```bash
+> xattr -cr "/Applications/Open DB Viewer.app"
+> ```
+> After running that command, you can open the app normally!
+
 ---
 
 ## 🛠️ Developer Setup (Build from Source)
