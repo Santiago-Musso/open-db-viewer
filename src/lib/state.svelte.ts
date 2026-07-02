@@ -390,24 +390,29 @@ class AppState {
       console.log("loadSchemas: list_schemas returned", list.length, "items:", list);
       this.schemas = list.map((s) => ({ name: s.name }));
       console.log("loadSchemas: set schemas to", this.schemas);
-      
-      // Fetch schema graph for public to enable smart FK routing in the grid and autocomplete
-      try {
-        const graph: any = await invoke("get_schema_graph", { 
-          connectionId: this.activeConnectionId, 
-          schema: "public" 
-        });
-        if (graph) {
-          if (graph.edges) this.schemaEdges = graph.edges;
-          if (graph.nodes) this.schemaNodes = graph.nodes;
-        }
-      } catch (e) {
-        console.warn("Failed to load schema graph for FKs", e);
-      }
-      
     } catch (e: any) {
       console.error("loadSchemas error:", e);
       this.schemaError = e.toString() || "Failed to load schemas";
+      return;
+    }
+      
+    // Fetch schema graph in background (fire-and-forget) so it doesn't block schema display
+    this.loadSchemaGraph();
+  }
+
+  async loadSchemaGraph() {
+    if (!this.activeConnectionId) return;
+    try {
+      const graph: any = await invoke("get_schema_graph", { 
+        connectionId: this.activeConnectionId, 
+        schema: "public" 
+      });
+      if (graph) {
+        if (graph.edges) this.schemaEdges = graph.edges;
+        if (graph.nodes) this.schemaNodes = graph.nodes;
+      }
+    } catch (e) {
+      console.warn("Failed to load schema graph for FKs", e);
     }
   }
 
