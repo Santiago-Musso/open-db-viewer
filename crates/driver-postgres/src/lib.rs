@@ -22,6 +22,8 @@ pub struct PostgresDriver {
     metadata_context: Arc<PostgresExecutionContext>,
     utility_context: Arc<PostgresExecutionContext>,
     dialect: Arc<dialect::PostgreDialect>,
+    #[allow(dead_code)]
+    type_registry: Arc<types::CustomTypeRegistry>,
 
     schema_cache: metadata::ObjectLookupCache<(), Vec<SchemaInfo>>,
     table_cache: metadata::ObjectLookupCache<String, Vec<TableInfo>>,
@@ -79,9 +81,33 @@ impl PostgresDriver {
         let metadata_arc = Arc::new(metadata_client);
         let utility_arc = Arc::new(utility_client);
 
-        let main_context = Arc::new(PostgresExecutionContext::new(main_arc).await?);
-        let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc).await?);
-        let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc).await?);
+        // Fetch all custom type definitions
+        let mut type_registry = types::CustomTypeRegistry::new();
+        if let Ok(rows) = utility_arc.query(
+            "SELECT t.oid, t.typname, n.nspname, t.typtype::text \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid",
+            &[]
+        ).await {
+            for row in rows {
+                let oid: u32 = row.get(0);
+                let name: String = row.get(1);
+                let schema: String = row.get(2);
+                let typtype_str: String = row.get(3);
+                let typtype = typtype_str.chars().next().unwrap_or(' ');
+                type_registry.insert(types::CustomTypeInfo {
+                    oid,
+                    name,
+                    schema,
+                    typtype,
+                });
+            }
+        }
+        let type_registry_arc = Arc::new(type_registry);
+
+        let main_context = Arc::new(PostgresExecutionContext::new(main_arc, type_registry_arc.clone()).await?);
+        let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc, type_registry_arc.clone()).await?);
+        let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc, type_registry_arc.clone()).await?);
         let dialect = Arc::new(dialect::PostgreDialect);
 
         let schema_cache = metadata::ObjectLookupCache::new();
@@ -94,6 +120,7 @@ impl PostgresDriver {
             metadata_context,
             utility_context,
             dialect,
+            type_registry: type_registry_arc,
             schema_cache,
             table_cache,
             column_cache,

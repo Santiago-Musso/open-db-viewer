@@ -8,14 +8,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio_postgres::Client;
 use crate::dialect::PostgreDialect;
+use crate::types::CustomTypeRegistry;
 
 pub struct PostgresExecutionContext {
     client: Arc<Client>,
     active_schema: tokio::sync::Mutex<String>,
+    pub type_registry: Arc<CustomTypeRegistry>,
 }
 
 impl PostgresExecutionContext {
-    pub async fn new(client: Arc<Client>) -> Result<Self, String> {
+    pub async fn new(client: Arc<Client>, type_registry: Arc<CustomTypeRegistry>) -> Result<Self, String> {
         let rows = client
             .query("SELECT current_schema()", &[])
             .await
@@ -29,6 +31,7 @@ impl PostgresExecutionContext {
         Ok(Self {
             client,
             active_schema: tokio::sync::Mutex::new(active_schema),
+            type_registry,
         })
     }
 
@@ -76,12 +79,14 @@ impl ExecutionContext for PostgresExecutionContext {
     async fn open_session(&self, _purpose: &str) -> Result<Box<dyn DbSession>, String> {
         Ok(Box::new(PostgresSession {
             client: self.client.clone(),
+            type_registry: self.type_registry.clone(),
         }))
     }
 }
 
 pub struct PostgresSession {
     client: Arc<Client>,
+    type_registry: Arc<CustomTypeRegistry>,
 }
 
 #[async_trait]
@@ -91,6 +96,7 @@ impl DbSession for PostgresSession {
         Ok(Box::new(PostgresStatement {
             client: self.client.clone(),
             stmt,
+            type_registry: self.type_registry.clone(),
             _fetch_size: 100,
             _timeout_seconds: None,
         }))
@@ -100,6 +106,7 @@ impl DbSession for PostgresSession {
 pub struct PostgresStatement {
     client: Arc<Client>,
     stmt: tokio_postgres::Statement,
+    type_registry: Arc<CustomTypeRegistry>,
     _fetch_size: usize,
     _timeout_seconds: Option<u32>,
 }
@@ -126,6 +133,7 @@ impl DbStatement for PostgresStatement {
         Ok(Box::new(PostgresResultSet {
             columns,
             stream: tokio::sync::Mutex::new(Box::pin(row_stream)),
+            type_registry: self.type_registry.clone(),
         }))
     }
 
@@ -157,6 +165,7 @@ pub struct PostgresResultSet {
             >,
         >,
     >,
+    type_registry: Arc<CustomTypeRegistry>,
 }
 
 #[async_trait]
@@ -174,7 +183,7 @@ impl DbResultSet for PostgresResultSet {
                 Some(Ok(row)) => {
                     let mut row_values = Vec::new();
                     for i in 0..row.len() {
-                        row_values.push(crate::types::pg_value_to_json(&row, i));
+                        row_values.push(crate::types::pg_value_to_json(&row, i, Some(&self.type_registry)));
                     }
                     rows.push(row_values);
                 }
@@ -193,3 +202,4 @@ impl DbResultSet for PostgresResultSet {
         }
     }
 }
+
