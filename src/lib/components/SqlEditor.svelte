@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { EditorState, Compartment } from "@codemirror/state";
-  import { EditorView, keymap, lineNumbers } from "@codemirror/view";
+  import { EditorState, Compartment, StateField, StateEffect } from "@codemirror/state";
+  import { EditorView, keymap, lineNumbers, Decoration, type DecorationSet } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
   import { autocompletion, acceptCompletion } from "@codemirror/autocomplete";
   import { sql, PostgreSQL } from "@codemirror/lang-sql";
@@ -11,14 +11,38 @@
     value: string;
     onChange: (val: string) => void;
     onExecute: () => void;
+    error?: any;
   }
 
-  let { value, onChange, onExecute }: Props = $props();
+  let { value, onChange, onExecute, error }: Props = $props();
 
   let container = $state<HTMLDivElement | null>(null);
   let view = $state<EditorView | null>(null);
   
   const sqlCompartment = new Compartment();
+
+  // State Effect and Field for syntax error squiggly underlines
+  const setErrorUnderline = StateEffect.define<{from: number, to: number} | null>();
+
+  const errorUnderlineField = StateField.define<DecorationSet>({
+    create() { return Decoration.none; },
+    update(underlines, tr) {
+      underlines = underlines.map(tr.changes);
+      for (let e of tr.effects) {
+        if (e.is(setErrorUnderline)) {
+          if (e.value) {
+            underlines = Decoration.set([
+              Decoration.mark({class: "cm-error-underline"}).range(e.value.from, e.value.to)
+            ]);
+          } else {
+            underlines = Decoration.none;
+          }
+        }
+      }
+      return underlines;
+    },
+    provide: f => EditorView.decorations.from(f)
+  });
 
   // Compute CodeMirror schema mapping from our global ER graph
   let cmSchema = $derived.by(() => {
@@ -40,6 +64,7 @@
         lineNumbers(),
         history(),
         autocompletion(),
+        errorUnderlineField,
         sqlCompartment.of(sql({ dialect: PostgreSQL, schema: cmSchema })),
         keymap.of([
           ...defaultKeymap,
@@ -76,6 +101,10 @@
           ".cm-tooltip-autocomplete > ul > li[aria-selected]": {
             backgroundColor: "var(--color-primary)",
             color: "#ffffff"
+          },
+          ".cm-error-underline": {
+            textDecoration: "underline wavy var(--color-error, #ef4444)",
+            backgroundColor: "rgba(239, 68, 68, 0.1)"
           }
         })
       ],
@@ -107,6 +136,32 @@
       view.dispatch({
         effects: sqlCompartment.reconfigure(sql({ dialect: PostgreSQL, schema: cmSchema }))
       });
+    }
+  });
+
+  // Reactively set the error squiggly underline whenever error coordinates change
+  $effect(() => {
+    if (view) {
+      if (error && typeof error === "object" && error.position !== null && error.position !== undefined) {
+        const pos = Number(error.position);
+        const zeroIndexedPos = pos > 0 ? pos - 1 : 0;
+        const docLen = view.state.doc.length;
+        const from = Math.min(zeroIndexedPos, docLen);
+        let to = from;
+        while (to < docLen && !/\s/.test(view.state.doc.slice(to, to + 1).toString())) {
+          to++;
+        }
+        if (from === to && from > 0) {
+          to = Math.min(from + 1, docLen);
+        }
+        view.dispatch({
+          effects: setErrorUnderline.of({ from, to })
+        });
+      } else {
+        view.dispatch({
+          effects: setErrorUnderline.of(null)
+        });
+      }
     }
   });
 </script>

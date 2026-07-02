@@ -8,6 +8,7 @@
   import ErDiagram from "../lib/components/ErDiagram.svelte";
   import SnippetsManager from "../lib/components/SnippetsManager.svelte";
   import CommandPalette from "../lib/components/CommandPalette.svelte";
+  import PlanNodeView from "../lib/components/PlanNodeView.svelte";
   import { 
     Play, 
     Square, 
@@ -37,7 +38,79 @@
   let testResult = $state<{ success: boolean; message: string } | null>(null);
   let theme = $state("dark");
   let activeConn = $derived(appState.connections.find(c => c.id === appState.activeConnectionId));
-  let workspaceMode = $state<"query" | "er">("query");
+  let workspaceMode = $state<"query" | "er" | "sessions" | "explain">("query");
+
+  // Explain Plan states
+  let explainPlan = $state<any>(null);
+  let explainError = $state<string | null>(null);
+  let explainLoading = $state<boolean>(false);
+
+  async function loadExplainPlan() {
+    if (!appState.activeTab || !appState.activeConnectionId) return;
+    explainLoading = true;
+    explainError = null;
+    explainPlan = null;
+    try {
+      const plan = await invoke("get_execution_plan", {
+        connectionId: appState.activeConnectionId,
+        sql: appState.activeTab.sql,
+      });
+      explainPlan = plan;
+    } catch (e: any) {
+      console.error(e);
+      explainError = e.message || e.toString();
+    } finally {
+      explainLoading = false;
+    }
+  }
+
+  // Session Manager states
+  let sessions = $state<any[]>([]);
+  let sessionsLoading = $state<boolean>(false);
+  let sessionsError = $state<string | null>(null);
+
+  async function loadSessions() {
+    if (!appState.activeConnectionId) return;
+    sessionsLoading = true;
+    sessionsError = null;
+    try {
+      sessions = await invoke("list_active_sessions", {
+        connectionId: appState.activeConnectionId,
+      });
+    } catch (e: any) {
+      console.error(e);
+      sessionsError = e.message || e.toString();
+    } finally {
+      sessionsLoading = false;
+    }
+  }
+
+  async function handleCancelSession(pid: number) {
+    if (!appState.activeConnectionId) return;
+    try {
+      await invoke("cancel_session", {
+        connectionId: appState.activeConnectionId,
+        pid,
+      });
+      await loadSessions();
+    } catch (e: any) {
+      alert("Failed to cancel query session: " + (e.message || e.toString()));
+    }
+  }
+
+  async function handleTerminateSession(pid: number) {
+    if (!appState.activeConnectionId) return;
+    if (!confirm(`Are you sure you want to terminate session PID ${pid}? This will force disconnect its client connection.`)) return;
+    try {
+      await invoke("terminate_session", {
+        connectionId: appState.activeConnectionId,
+        pid,
+      });
+      await loadSessions();
+    } catch (e: any) {
+      alert("Failed to terminate query session: " + (e.message || e.toString()));
+    }
+  }
   let isPaletteOpen = $state(false);
 
   async function handlePaletteAction(actionId: string) {
@@ -413,12 +486,136 @@
             <button class="btn-mode" class:active={workspaceMode === 'er'} onclick={() => workspaceMode = 'er'}>
               ER Diagram
             </button>
+            {#if activeConn?.driver === 'postgres'}
+              <button class="btn-mode" class:active={workspaceMode === 'explain'} onclick={() => { workspaceMode = 'explain'; loadExplainPlan(); }}>
+                Explain Plan
+              </button>
+              <button class="btn-mode" class:active={workspaceMode === 'sessions'} onclick={() => { workspaceMode = 'sessions'; loadSessions(); }}>
+                Sessions
+              </button>
+            {/if}
           </div>
         </header>
 
         {#if workspaceMode === 'er'}
           <div class="workspace-area">
             <ErDiagram />
+          </div>
+        {:else if workspaceMode === 'explain'}
+          <div class="workspace-area" style="padding: 20px; overflow-y: auto; background-color: var(--bg-editor); height: 100%;">
+            <div style="max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; width: 100%;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2 style="margin: 0; font-size: 18px; color: var(--text-normal); font-weight: 600;">Query Execution Plan</h2>
+                <button class="btn-control run" onclick={loadExplainPlan} disabled={explainLoading} style="display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 13px; font-weight: 500; border-radius: 4px; background-color: var(--color-primary); color: white; border: none; cursor: pointer;">
+                  <Play size={14} fill="currentColor" /> Re-Explain
+                </button>
+              </div>
+              {#if explainLoading}
+                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px; color: var(--text-muted);">
+                  <div class="spinner" style="margin-bottom: 12px; border: 2px solid rgba(255,255,255,0.1); border-left-color: var(--color-primary); width: 24px; height: 24px; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                  <p>Generating explain plan...</p>
+                </div>
+              {:else if explainError}
+                <div style="padding: 16px; border: 1px solid var(--border-color); border-radius: 6px; background-color: rgba(239, 68, 68, 0.1); color: var(--color-error, #ef4444);">
+                  <p style="margin: 0 0 8px 0; font-weight: 600;">Failed to generate plan</p>
+                  <pre style="margin: 0; font-family: monospace; white-space: pre-wrap; font-size: 12px;">{explainError}</pre>
+                </div>
+              {:else if explainPlan}
+                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; width: 100%;">
+                  <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-card);">
+                    <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 600;">Startup Cost</div>
+                    <div style="font-size: 18px; font-weight: 600; margin-top: 4px; color: var(--text-normal);">{explainPlan["Startup Cost"]}</div>
+                  </div>
+                  <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-card);">
+                    <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 600;">Total Cost</div>
+                    <div style="font-size: 18px; font-weight: 600; margin-top: 4px; color: var(--text-normal);">{explainPlan["Total Cost"]}</div>
+                  </div>
+                  <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-card);">
+                    <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 600;">Plan Rows</div>
+                    <div style="font-size: 18px; font-weight: 600; margin-top: 4px; color: var(--text-normal);">{explainPlan["Plan Rows"]}</div>
+                  </div>
+                  <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-card);">
+                    <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 600;">Plan Width</div>
+                    <div style="font-size: 18px; font-weight: 600; margin-top: 4px; color: var(--text-normal);">{explainPlan["Plan Width"]} bytes</div>
+                  </div>
+                </div>
+                <div style="padding: 16px; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--bg-card); display: flex; flex-direction: column; gap: 12px; width: 100%;">
+                  <h3 style="margin: 0; font-size: 14px; color: var(--text-muted); font-weight: 600;">Visual Tree Plan</h3>
+                  <PlanNodeView node={explainPlan} />
+                </div>
+              {:else}
+                <div style="padding: 48px; text-align: center; color: var(--text-muted); width: 100%;">
+                  No execution plan generated. Enter a SQL statement and click Re-Explain.
+                </div>
+              {/if}
+            </div>
+          </div>
+        {:else if workspaceMode === 'sessions'}
+          <div class="workspace-area" style="padding: 20px; overflow-y: auto; background-color: var(--bg-editor); height: 100%;">
+            <div style="max-width: 1000px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; width: 100%;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2 style="margin: 0; font-size: 18px; color: var(--text-normal); font-weight: 600;">Active Backend Sessions</h2>
+                <button class="btn-control run" onclick={loadSessions} disabled={sessionsLoading} style="display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 13px; font-weight: 500; border-radius: 4px; background-color: var(--color-primary); color: white; border: none; cursor: pointer;">
+                  Refresh Sessions
+                </button>
+              </div>
+              {#if sessionsLoading}
+                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px; color: var(--text-muted);">
+                  <div class="spinner" style="margin-bottom: 12px; border: 2px solid rgba(255,255,255,0.1); border-left-color: var(--color-primary); width: 24px; height: 24px; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                  <p>Loading sessions...</p>
+                </div>
+              {:else if sessionsError}
+                <div style="padding: 16px; border: 1px solid var(--border-color); border-radius: 6px; background-color: rgba(239, 68, 68, 0.1); color: var(--color-error, #ef4444);">
+                  <p style="margin: 0; font-weight: 600;">Failed to load sessions: {sessionsError}</p>
+                </div>
+              {:else if sessions.length > 0}
+                <div style="border: 1px solid var(--border-color); border-radius: 6px; overflow: hidden; background-color: var(--bg-card); width: 100%;">
+                  <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; color: var(--text-normal);">
+                    <thead>
+                      <tr style="border-bottom: 1px solid var(--border-color); background-color: var(--bg-editor-gutter);">
+                        <th style="padding: 10px 12px; font-weight: 600;">PID</th>
+                        <th style="padding: 10px 12px; font-weight: 600;">User</th>
+                        <th style="padding: 10px 12px; font-weight: 600;">State</th>
+                        <th style="padding: 10px 12px; font-weight: 600;">Client Addr</th>
+                        <th style="padding: 10px 12px; font-weight: 600;">Started At</th>
+                        <th style="padding: 10px 12px; font-weight: 600; width: 40%;">Active Query</th>
+                        <th style="padding: 10px 12px; font-weight: 600; text-align: right;">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each sessions as sess}
+                        <tr style="border-bottom: 1px solid var(--border-color);">
+                          <td style="padding: 10px 12px; font-family: monospace;">{sess.pid}</td>
+                          <td style="padding: 10px 12px;">{sess.username || 'N/A'}</td>
+                          <td style="padding: 10px 12px;">
+                            <span style="display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; background-color: {sess.state === 'active' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(156, 163, 175, 0.15)'}; color: {sess.state === 'active' ? '#10b981' : '#9ca3af'};">
+                              {sess.state || 'idle'}
+                            </span>
+                          </td>
+                          <td style="padding: 10px 12px; font-family: monospace;">{sess.client_addr || 'local'}</td>
+                          <td style="padding: 10px 12px; font-size: 11px; color: var(--text-muted);">{sess.query_start || 'N/A'}</td>
+                          <td style="padding: 10px 12px; font-family: monospace; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 250px;" title={sess.query}>
+                            {sess.query || '<no query>'}
+                          </td>
+                          <td style="padding: 10px 12px; text-align: right; display: flex; gap: 6px; justify-content: flex-end;">
+                            <button style="padding: 4px 8px; font-size: 11px; border: 1px solid var(--border-color); border-radius: 4px; background-color: var(--bg-editor); color: var(--text-normal); cursor: pointer;" onclick={() => handleCancelSession(sess.pid)} title="Cancel Session Query">
+                              Cancel
+                            </button>
+                            <button style="padding: 4px 8px; font-size: 11px; border: 1px solid var(--color-error, #ef4444); border-radius: 4px; background-color: rgba(239, 68, 68, 0.1); color: var(--color-error, #ef4444); cursor: pointer;" onclick={() => handleTerminateSession(sess.pid)} title="Terminate Connection">
+                              Kill
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {:else}
+                <div style="padding: 48px; text-align: center; color: var(--text-muted); width: 100%;">
+                  No active client sessions found.
+                </div>
+              {/if}
+            </div>
           </div>
         {:else if appState.activeTab}
           <div class="workspace-area">
@@ -428,6 +625,7 @@
                 value={appState.activeTab.sql}
                 onChange={(val) => { if (appState.activeTab) appState.activeTab.sql = val; }}
                 onExecute={() => appState.executeQuery()}
+                error={appState.activeTab.error}
               />
             </div>
 
@@ -477,7 +675,15 @@
               {:else if appState.activeTab.error}
                 <div class="results-error">
                   <h3>Query Error</h3>
-                  <pre>{appState.activeTab.error}</pre>
+                  <pre>{typeof appState.activeTab.error === 'object' ? appState.activeTab.error.message : appState.activeTab.error}</pre>
+                  {#if typeof appState.activeTab.error === 'object' && appState.activeTab.error.sql_state}
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 12px; color: var(--text-muted);">
+                      SQL State: <span style="color: var(--color-primary);">{appState.activeTab.error.sql_state}</span>
+                      {#if appState.activeTab.error.position !== null}
+                        &nbsp;|&nbsp;Position: <span style="color: var(--color-primary);">{appState.activeTab.error.position}</span>
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
               {:else}
                 <ResultGrid 

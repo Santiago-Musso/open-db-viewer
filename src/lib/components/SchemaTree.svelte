@@ -5,8 +5,10 @@
     Table, 
     Columns, 
     ChevronRight, 
-    ChevronDown 
+    ChevronDown,
+    RefreshCw
   } from "lucide-svelte";
+  import { invoke } from "@tauri-apps/api/core";
 
   let expandedSchemas = $state<Record<string, boolean>>({});
   let expandedTables = $state<Record<string, boolean>>({});
@@ -30,6 +32,39 @@
       if (!table?.columns) {
         await appState.loadColumns(schemaName, tableName);
       }
+    }
+  }
+
+  async function refreshSchema(schemaName: string) {
+    if (!appState.activeConnectionId) return;
+    try {
+      await invoke("refresh_metadata_cache", {
+        connectionId: appState.activeConnectionId,
+        schema: schemaName,
+      });
+      // Force reload the tables of this schema
+      await appState.loadTables(schemaName);
+      // Reload schema graph too
+      await appState.loadSchemaGraph();
+    } catch (e: any) {
+      alert("Failed to refresh schema: " + e.toString());
+    }
+  }
+
+  async function refreshTable(schemaName: string, tableName: string) {
+    if (!appState.activeConnectionId) return;
+    try {
+      await invoke("refresh_metadata_cache", {
+        connectionId: appState.activeConnectionId,
+        schema: schemaName,
+        table: tableName,
+      });
+      // Force reload columns
+      await appState.loadColumns(schemaName, tableName);
+      // Reload schema graph too
+      await appState.loadSchemaGraph();
+    } catch (e: any) {
+      alert("Failed to refresh table: " + e.toString());
     }
   }
 
@@ -81,6 +116,15 @@
           {/if}
           <Database size={14} class="icon schema-icon" />
           <span class="node-label">{schema.name}</span>
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <span 
+            class="btn-node-refresh" 
+            onclick={(e) => { e.stopPropagation(); refreshSchema(schema.name); }} 
+            title="Refresh Schema Cache"
+          >
+            <RefreshCw size={10} />
+          </span>
         </button>
 
         {#if expandedSchemas[schema.name]}
@@ -105,6 +149,15 @@
                     {/if}
                     <Table size={14} class="icon table-icon" />
                     <span class="node-label">{table.name}</span>
+                    <!-- svelte-ignore a11y_click_events_have_key_events -->
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <span 
+                      class="btn-node-refresh" 
+                      onclick={(e) => { e.stopPropagation(); refreshTable(schema.name, table.name); }} 
+                      title="Refresh Table Cache"
+                    >
+                      <RefreshCw size={10} />
+                    </span>
                   </button>
 
                   {#if expandedTables[tableKey]}
@@ -200,6 +253,29 @@
     text-overflow: ellipsis;
   }
 
+  .btn-node-refresh {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 2px;
+    border-radius: 4px;
+    transition: color 0.15s, background-color 0.15s;
+  }
+
+  .btn-node-refresh:hover {
+    color: var(--text-normal);
+    background-color: var(--bg-hover-dark, rgba(255,255,255,0.1));
+  }
+
+  .node-header:hover .btn-node-refresh {
+    display: inline-flex;
+  }
+
   .leaf-node {
     cursor: default;
     padding-left: 30px;
@@ -248,36 +324,5 @@
 
   .schema-error p {
     margin: 0 0 6px 0;
-    color: var(--color-error, #f87171);
-    font-weight: 500;
-  }
-
-  .error-msg {
-    font-family: Menlo, Monaco, monospace;
-    font-size: 11px;
-    color: var(--text-muted);
-    background: var(--bg-hover, rgba(255, 255, 255, 0.05));
-    padding: 8px;
-    border-radius: 4px;
-    margin-bottom: 12px;
-    word-break: break-all;
-    max-height: 120px;
-    overflow-y: auto;
-  }
-
-  .btn-retry {
-    background-color: var(--accent-primary, #6366f1);
-    color: white;
-    border: none;
-    padding: 6px 12px;
-    border-radius: 4px;
-    font-size: 11px;
-    cursor: pointer;
-    font-weight: 500;
-    transition: background-color 0.15s ease;
-  }
-
-  .btn-retry:hover {
-    background-color: var(--accent-hover, #4f46e5);
   }
 </style>

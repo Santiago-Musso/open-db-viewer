@@ -21,7 +21,7 @@ export interface Tab {
   queryId: string | null;
   columns: { name: string; data_type: string }[];
   rows: any[][];
-  error: string | null;
+  error: any;
   executionTime: number | null; // in ms
   rowCount: number;
   offset: number;
@@ -528,7 +528,7 @@ class AppState {
         }).catch(console.error);
       }
     } catch (e: any) {
-      tab.error = e.toString();
+      tab.error = e;
       tab.loading = false;
       tab.executionTime = Math.round(performance.now() - start);
 
