@@ -50,6 +50,11 @@ where
         let mut write = self.cache.write().await;
         write.remove(key);
     }
+
+    pub async fn clear(&self) {
+        let mut write = self.cache.write().await;
+        write.clear();
+    }
 }
 
 #[cfg(test)]

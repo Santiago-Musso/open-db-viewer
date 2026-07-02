@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use driver_api::{
     ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
     SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema, SqlDialect,
-    DatabaseError, PlanNode, DbSessionInfo,
+    DatabaseError, PlanNode, DbSessionInfo, TableKind, TableStats, IndexInfo, ConstraintInfo,
+    ConstraintType, SequenceInfo, ProcedureInfo, ExtensionInfo, ExplainOptions,
 };
 use futures_util::Stream;
 use std::collections::HashMap;
@@ -10,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
+use std::sync::atomic::Ordering;
 
 pub mod connection;
 pub mod dialect;
@@ -17,7 +19,7 @@ pub mod metadata;
 pub mod plan;
 pub mod types;
 
-use connection::PostgresExecutionContext;
+use connection::{PostgresExecutionContext, map_db_error};
 
 pub struct PostgresDriver {
     main_context: Arc<PostgresExecutionContext>,
@@ -67,6 +69,8 @@ impl PostgresDriver {
                 conn_str.push_str(&format!(" dbname={}", db_name));
             }
         }
+        // R22: Add application_name client info
+        conn_str.push_str(" application_name=open-db-viewer");
 
         // Connect three parallel contexts
         let (main_res, metadata_res, utility_res) = tokio::join!(
@@ -83,12 +87,30 @@ impl PostgresDriver {
         let metadata_arc = Arc::new(metadata_client);
         let utility_arc = Arc::new(utility_client);
 
-        // Fetch all custom type definitions
+        // R8: standard_conforming_strings detection
+        let dialect = Arc::new(dialect::PostgreDialect::default());
+        if let Ok(row) = utility_arc.query_one("SHOW standard_conforming_strings", &[]).await {
+            let scs_val: String = row.get(0);
+            dialect.standard_conforming_strings.store(scs_val == "on", Ordering::SeqCst);
+        }
+
+        // Fetch all custom type definitions (R17)
         let mut type_registry = types::CustomTypeRegistry::new();
         if let Ok(rows) = utility_arc.query(
-            "SELECT t.oid, t.typname, n.nspname, t.typtype::text \
+            "SELECT t.oid, t.typname, n.nspname, t.typtype::text, \
+                    t.typcategory::text, t.typelem, t.typbasetype, \
+                    bt.typname as base_type_name, \
+                    pg_catalog.format_type(t.oid, t.typtypmod) as full_type_name, \
+                    d.description \
              FROM pg_catalog.pg_type t \
-             JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid",
+             LEFT OUTER JOIN pg_catalog.pg_type et ON et.oid = t.typelem \
+             LEFT OUTER JOIN pg_catalog.pg_class c ON c.oid = t.typrelid \
+             LEFT OUTER JOIN pg_catalog.pg_type bt ON bt.oid = t.typbasetype \
+             LEFT OUTER JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid \
+             LEFT OUTER JOIN pg_catalog.pg_description d ON t.oid = d.objoid AND d.classoid = 'pg_type'::regclass \
+             WHERE t.typname IS NOT NULL \
+               AND (c.relkind IS NULL OR c.relkind = 'c') \
+               AND (et.typcategory IS NULL OR et.typcategory <> 'C')",
             &[]
         ).await {
             for row in rows {
@@ -97,11 +119,25 @@ impl PostgresDriver {
                 let schema: String = row.get(2);
                 let typtype_str: String = row.get(3);
                 let typtype = typtype_str.chars().next().unwrap_or(' ');
+                let typcategory_str: String = row.get(4);
+                let typcategory = typcategory_str.chars().next().unwrap_or(' ');
+                let typelem: u32 = row.get(5);
+                let typbasetype: u32 = row.get(6);
+                let base_type_name: Option<String> = row.get(7);
+                let full_type_name: String = row.get(8);
+                let description: Option<String> = row.get(9);
+
                 type_registry.insert(types::CustomTypeInfo {
                     oid,
                     name,
                     schema,
                     typtype,
+                    typcategory,
+                    typelem,
+                    typbasetype,
+                    base_type_name,
+                    full_type_name,
+                    description,
                 });
             }
         }
@@ -110,7 +146,6 @@ impl PostgresDriver {
         let main_context = Arc::new(PostgresExecutionContext::new(main_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
         let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
         let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
-        let dialect = Arc::new(dialect::PostgreDialect);
 
         let schema_cache = metadata::ObjectLookupCache::new();
         let table_cache = metadata::ObjectLookupCache::new();
@@ -170,25 +205,20 @@ impl DataSource for PostgresDriver {
 #[async_trait]
 impl RelationalDriver for PostgresDriver {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, DatabaseError> {
-        let val = self.schema_cache.get_or_load((), || async {
-            let ctx = self.open_context("metadata").await?;
-            let session = ctx.open_session("metadata").await?;
-            let stmt = session
-                .prepare_statement(
-                    "SELECT schema_name FROM information_schema.schemata \
-                     WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
-                     ORDER BY schema_name",
-                )
-                .await?;
-            let mut rs = stmt.execute_query().await?;
+        let metadata_ctx = self.metadata_context.clone();
+        let val = self.schema_cache.get_or_load((), || async move {
+            let rows = metadata_ctx.client.query(
+                "SELECT n.nspname FROM pg_catalog.pg_namespace n \
+                 WHERE nspname NOT LIKE 'pg_%' \
+                   AND nspname <> 'information_schema' \
+                 ORDER BY n.nspname",
+                &[],
+            ).await.map_err(map_db_error)?;
 
             let mut schemas = Vec::new();
-            while let Some(batch) = rs.next_row_batch(100).await? {
-                for row in batch.rows {
-                    if let Some(serde_json::Value::String(name)) = row.first() {
-                        schemas.push(SchemaInfo { name: name.clone() });
-                    }
-                }
+            for row in rows {
+                let name: String = row.get(0);
+                schemas.push(SchemaInfo { name });
             }
             Ok(schemas)
         }).await?;
@@ -198,35 +228,69 @@ impl RelationalDriver for PostgresDriver {
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, DatabaseError> {
         let schema_owned = schema.to_string();
         let loader_schema = schema_owned.clone();
+        let metadata_ctx = self.metadata_context.clone();
         let val = self.table_cache.get_or_load(schema_owned, || async move {
-            let ctx = self.open_context("metadata").await?;
-            let session = ctx.open_session("metadata").await?;
-            let escaped_schema = self.dialect.escape_string_literal(&loader_schema);
-            let sql = format!(
-                "SELECT table_schema, table_name FROM information_schema.tables \
-                 WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
-                 ORDER BY table_name",
-                escaped_schema
-            );
-            let stmt = session.prepare_statement(&sql).await?;
-            let mut rs = stmt.execute_query().await?;
+            let rows = metadata_ctx.client.query(
+                "SELECT c.oid, c.relname, c.relkind::text, pg_catalog.obj_description(c.oid, 'pg_class') as description \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+                 WHERE n.nspname = $1 \
+                   AND c.relkind IN ('r', 'p', 'f', 'v', 'm') \
+                 ORDER BY c.relname",
+                &[&loader_schema],
+            ).await.map_err(map_db_error)?;
 
-            let mut tables = Vec::new();
-            while let Some(batch) = rs.next_row_batch(100).await? {
-                for row in batch.rows {
-                    if row.len() >= 2 {
-                        if let (
-                            serde_json::Value::String(schema_val),
-                            serde_json::Value::String(name_val),
-                        ) = (&row[0], &row[1])
-                        {
-                            tables.push(TableInfo {
-                                schema: schema_val.clone(),
-                                name: name_val.clone(),
-                            });
-                        }
+            let oids: Vec<u32> = rows.iter().map(|row| row.get::<_, u32>(0)).collect();
+            let mut stats_map = HashMap::new();
+            if !oids.is_empty() {
+                if let Ok(stats_rows) = metadata_ctx.client.query(
+                    "SELECT oid, \
+                            pg_catalog.pg_relation_size(oid) as table_size, \
+                            pg_catalog.pg_total_relation_size(oid) as total_size, \
+                            GREATEST(reltuples, 0)::bigint as estimated_row_count \
+                     FROM pg_catalog.pg_class \
+                     WHERE oid = ANY($1)",
+                    &[&oids],
+                ).await {
+                    for r in stats_rows {
+                        let oid: u32 = r.get(0);
+                        let table_size: i64 = r.get(1);
+                        let total_size: i64 = r.get(2);
+                        let estimated_row_count: i64 = r.get(3);
+                        stats_map.insert(oid, TableStats {
+                            table_size,
+                            total_size,
+                            estimated_row_count,
+                        });
                     }
                 }
+            }
+
+            let mut tables = Vec::new();
+            for row in rows {
+                let oid_u32: u32 = row.get(0);
+                let name: String = row.get(1);
+                let relkind: String = row.get(2);
+                let description: Option<String> = row.get(3);
+
+                let table_kind = match relkind.as_str() {
+                    "p" => TableKind::Partitioned,
+                    "f" => TableKind::Foreign,
+                    "v" => TableKind::View,
+                    "m" => TableKind::MaterializedView,
+                    _ => TableKind::Regular,
+                };
+
+                let stats = stats_map.get(&oid_u32).cloned();
+
+                tables.push(TableInfo {
+                    schema: loader_schema.clone(),
+                    name,
+                    oid: oid_u32 as u64,
+                    table_kind,
+                    description,
+                    stats,
+                });
             }
             Ok(tables)
         }).await?;
@@ -236,36 +300,43 @@ impl RelationalDriver for PostgresDriver {
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, DatabaseError> {
         let key = (schema.to_string(), table.to_string());
         let loader_key = key.clone();
+        let metadata_ctx = self.metadata_context.clone();
         let val = self.column_cache.get_or_load(key, || async move {
-            let ctx = self.open_context("metadata").await?;
-            let session = ctx.open_session("metadata").await?;
-            let escaped_schema = self.dialect.escape_string_literal(&loader_key.0);
-            let escaped_table = self.dialect.escape_string_literal(&loader_key.1);
-            let sql = format!(
-                "SELECT column_name, data_type FROM information_schema.columns \
-                 WHERE table_schema = '{}' AND table_name = '{}' \
-                 ORDER BY ordinal_position",
-                escaped_schema, escaped_table
-            );
-            let stmt = session.prepare_statement(&sql).await?;
-            let mut rs = stmt.execute_query().await?;
+            let rows = metadata_ctx.client.query(
+                "SELECT a.attname, \
+                        pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type, \
+                        a.attnotnull as not_null, \
+                        pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) as default_value, \
+                        d.description, \
+                        a.atttypid as type_oid \
+                 FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_class c ON a.attrelid = c.oid \
+                 JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+                 LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum \
+                 LEFT OUTER JOIN pg_catalog.pg_description d ON c.oid = d.objoid AND a.attnum = d.objsubid \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                &[&loader_key.0, &loader_key.1],
+            ).await.map_err(map_db_error)?;
 
             let mut columns = Vec::new();
-            while let Some(batch) = rs.next_row_batch(100).await? {
-                for row in batch.rows {
-                    if row.len() >= 2 {
-                        if let (
-                            serde_json::Value::String(name_val),
-                            serde_json::Value::String(data_type_val),
-                        ) = (&row[0], &row[1])
-                        {
-                            columns.push(ColumnInfo {
-                                name: name_val.clone(),
-                                data_type: data_type_val.clone(),
-                            });
-                        }
-                    }
-                }
+            for row in rows {
+                let name: String = row.get(0);
+                let data_type: String = row.get(1);
+                let not_null: bool = row.get(2);
+                let default_value: Option<String> = row.get(3);
+                let description: Option<String> = row.get(4);
+                let type_oid: u32 = row.get(5);
+
+                columns.push(ColumnInfo {
+                    name,
+                    data_type,
+                    is_nullable: !not_null,
+                    default_value,
+                    description,
+                    type_oid,
+                });
             }
             Ok(TableSchema { columns })
         }).await?;
@@ -274,61 +345,102 @@ impl RelationalDriver for PostgresDriver {
 
     async fn get_table_ddl(&self, schema: &str, table: &str) -> Result<String, DatabaseError> {
         let cols = self.describe_table(schema, table).await?;
+
         let mut ddl = format!("CREATE TABLE {}.{} (\n", schema, table);
-        let col_definitions: Vec<String> = cols
-            .columns
-            .iter()
-            .map(|c| format!("    {} {}", c.name, c.data_type.to_uppercase()))
-            .collect();
-        ddl.push_str(&col_definitions.join(",\n"));
+        let mut parts = Vec::new();
+
+        for c in &cols.columns {
+            let mut col_def = format!("    {} {}", c.name, c.data_type.to_uppercase());
+            if !c.is_nullable {
+                col_def.push_str(" NOT NULL");
+            }
+            if let Some(def) = &c.default_value {
+                col_def.push_str(&format!(" DEFAULT {}", def));
+            }
+            parts.push(col_def);
+        }
+
+        if let Ok(constraint_rows) = self.metadata_context.client.query(
+            "SELECT conname, pg_catalog.pg_get_constraintdef(oid) as definition \
+             FROM pg_catalog.pg_constraint \
+             WHERE conrelid = (SELECT c.oid FROM pg_catalog.pg_class c \
+                               JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+                               WHERE n.nspname = $1 AND c.relname = $2) \
+             ORDER BY contype, conname",
+            &[&schema, &table],
+        ).await {
+            for row in constraint_rows {
+                let conname: String = row.get(0);
+                let definition: String = row.get(1);
+                parts.push(format!("    CONSTRAINT {} {}", conname, definition));
+            }
+        }
+
+        ddl.push_str(&parts.join(",\n"));
         ddl.push_str("\n);");
+
+        if let Ok(index_rows) = self.metadata_context.client.query(
+            "SELECT pg_catalog.pg_get_indexdef(indexrelid) as indexdef \
+             FROM pg_catalog.pg_index \
+             WHERE indrelid = (SELECT c.oid FROM pg_catalog.pg_class c \
+                               JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+                               WHERE n.nspname = $1 AND c.relname = $2) \
+               AND NOT indisprimary",
+            &[&schema, &table],
+        ).await {
+            for row in index_rows {
+                let index_def: String = row.get(0);
+                ddl.push_str(&format!("\n\n{};", index_def));
+            }
+        }
+
         Ok(ddl)
     }
 
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, DatabaseError> {
         let schema_owned = schema.to_string();
         let loader_schema = schema_owned.clone();
+        let metadata_ctx = self.metadata_context.clone();
         let val = self.graph_cache.get_or_load(schema_owned, || async move {
-            let ctx = self.open_context("metadata").await?;
-            let session = ctx.open_session("metadata").await?;
-            let escaped_schema = self.dialect.escape_string_literal(&loader_schema);
-
-            let col_sql = format!(
-                "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type \
+            let col_rows = metadata_ctx.client.query(
+                "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type, \
+                        a.attnotnull as not_null, pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) as default_value, \
+                        d.description, a.atttypid as type_oid \
                  FROM pg_class c \
                  JOIN pg_namespace n ON c.relnamespace = n.oid \
                  JOIN pg_attribute a ON a.attrelid = c.oid \
                  JOIN pg_type t ON a.atttypid = t.oid \
-                 WHERE n.nspname = '{}' \
+                 LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum \
+                 LEFT OUTER JOIN pg_catalog.pg_description d ON c.oid = d.objoid AND a.attnum = d.objsubid \
+                 WHERE n.nspname = $1 \
                    AND c.relkind = 'r' \
                    AND a.attnum > 0 \
                    AND NOT a.attisdropped \
                  ORDER BY c.relname, a.attnum",
-                escaped_schema
-            );
-            let col_stmt = session.prepare_statement(&col_sql).await?;
-            let mut col_rs = col_stmt.execute_query().await?;
+                &[&loader_schema],
+            ).await.map_err(map_db_error)?;
 
             let mut table_map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
-            while let Some(batch) = col_rs.next_row_batch(100).await? {
-                for row in batch.rows {
-                    if row.len() >= 3 {
-                        if let (
-                            serde_json::Value::String(table_name),
-                            serde_json::Value::String(col_name),
-                            serde_json::Value::String(data_type),
-                        ) = (&row[0], &row[1], &row[2])
-                        {
-                            table_map
-                                .entry(table_name.clone())
-                                .or_default()
-                                .push(ColumnInfo {
-                                    name: col_name.clone(),
-                                    data_type: data_type.clone(),
-                                });
-                        }
-                    }
-                }
+            for row in col_rows {
+                let table_name: String = row.get(0);
+                let col_name: String = row.get(1);
+                let data_type: String = row.get(2);
+                let not_null: bool = row.get(3);
+                let default_value: Option<String> = row.get(4);
+                let description: Option<String> = row.get(5);
+                let type_oid: u32 = row.get(6);
+
+                table_map
+                    .entry(table_name.clone())
+                    .or_default()
+                    .push(ColumnInfo {
+                        name: col_name,
+                        data_type,
+                        is_nullable: !not_null,
+                        default_value,
+                        description,
+                        type_oid,
+                    });
             }
 
             let nodes: Vec<SchemaNode> = table_map
@@ -340,47 +452,65 @@ impl RelationalDriver for PostgresDriver {
                 })
                 .collect();
 
-            let fk_sql = format!(
-                "SELECT \
-                    c.conname, \
-                    cl1.relname, \
-                    a1.attname, \
-                    cl2.relname, \
-                    a2.attname \
-                 FROM pg_constraint c \
-                 JOIN pg_class cl1 ON c.conrelid = cl1.oid \
-                 JOIN pg_class cl2 ON c.confrelid = cl2.oid \
-                 JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid \
-                 JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid \
-                 JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid \
-                 WHERE c.contype = 'f' AND n1.nspname = '{}'",
-                escaped_schema
-            );
-            let fk_stmt = session.prepare_statement(&fk_sql).await?;
-            let mut fk_rs = fk_stmt.execute_query().await?;
+            let fk_rows = metadata_ctx.client.query(
+                "SELECT con.conname, \
+                        cl1.relname as src_table, \
+                        a1.attname as src_column, \
+                        cl2.relname as tgt_table, \
+                        a2.attname as tgt_column, \
+                        con.confmatchtype::text, \
+                        con.confupdtype::text, \
+                        con.confdeltype::text \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class cl1 ON con.conrelid = cl1.oid \
+                 JOIN pg_catalog.pg_class cl2 ON con.confrelid = cl2.oid \
+                 JOIN pg_catalog.pg_namespace n1 ON cl1.relnamespace = n1.oid \
+                 CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS src(attnum, ord) \
+                 CROSS JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS tgt(attnum, ord) \
+                 JOIN pg_catalog.pg_attribute a1 ON a1.attrelid = cl1.oid AND a1.attnum = src.attnum \
+                 JOIN pg_catalog.pg_attribute a2 ON a2.attrelid = cl2.oid AND a2.attnum = tgt.attnum \
+                 WHERE con.contype = 'f' AND n1.nspname = $1 \
+                   AND src.ord = tgt.ord",
+                &[&loader_schema],
+            ).await.map_err(map_db_error)?;
 
             let mut edges = Vec::new();
-            while let Some(batch) = fk_rs.next_row_batch(100).await? {
-                for row in batch.rows {
-                    if row.len() >= 5 {
-                        if let (
-                            serde_json::Value::String(conname),
-                            serde_json::Value::String(table1),
-                            serde_json::Value::String(col1),
-                            serde_json::Value::String(table2),
-                            serde_json::Value::String(col2),
-                        ) = (&row[0], &row[1], &row[2], &row[3], &row[4])
-                        {
-                            edges.push(SchemaEdge {
-                                id: conname.clone(),
-                                source: table1.clone(),
-                                source_handle: col1.clone(),
-                                target: table2.clone(),
-                                target_handle: col2.clone(),
-                            });
-                        }
-                    }
-                }
+            for row in fk_rows {
+                let conname: String = row.get(0);
+                let table1: String = row.get(1);
+                let col1: String = row.get(2);
+                let table2: String = row.get(3);
+                let col2: String = row.get(4);
+                let match_type_char: String = row.get(5);
+                let update_rule_char: String = row.get(6);
+                let delete_rule_char: String = row.get(7);
+
+                let match_type = match match_type_char.as_str() {
+                    "f" => Some("FULL".to_string()),
+                    "p" => Some("PARTIAL".to_string()),
+                    "s" => Some("SIMPLE".to_string()),
+                    _ => None,
+                };
+
+                let rule_map = |c: &str| match c {
+                    "c" => Some("CASCADE".to_string()),
+                    "r" => Some("RESTRICT".to_string()),
+                    "n" => Some("SET_NULL".to_string()),
+                    "d" => Some("SET_DEFAULT".to_string()),
+                    "a" => Some("NO_ACTION".to_string()),
+                    _ => None,
+                };
+
+                edges.push(SchemaEdge {
+                    id: conname,
+                    source: table1,
+                    source_handle: col1,
+                    target: table2,
+                    target_handle: col2,
+                    match_type,
+                    update_rule: rule_map(&update_rule_char),
+                    delete_rule: rule_map(&delete_rule_char),
+                });
             }
 
             Ok(SchemaGraph { nodes, edges })
@@ -460,102 +590,98 @@ impl RelationalDriver for PostgresDriver {
         Ok(())
     }
 
-    async fn get_execution_plan(&self, sql: &str) -> Result<PlanNode, DatabaseError> {
-        let ctx = self.open_context("utility").await?;
-        let session = ctx.open_session("utility").await?;
+    async fn get_execution_plan(&self, sql: &str, options: ExplainOptions) -> Result<PlanNode, DatabaseError> {
+        let mut opts = vec!["FORMAT JSON"];
+        if options.analyze { opts.push("ANALYZE"); }
+        if options.verbose { opts.push("VERBOSE"); }
+        if options.costs { opts.push("COSTS"); }
+        if options.buffers { opts.push("BUFFERS"); }
+        if options.timing { opts.push("TIMING"); }
+        if options.settings { opts.push("SETTINGS"); }
+
+        let explain_sql = format!("EXPLAIN ({}) {}", opts.join(", "), sql);
+        let rows = self.utility_context.client.query(&explain_sql, &[]).await.map_err(map_db_error)?;
         
-        let explain_sql = format!("EXPLAIN (FORMAT JSON) {}", sql);
-        let stmt = session.prepare_statement(&explain_sql).await?;
-        let mut rs = stmt.execute_query().await?;
-        
-        if let Some(batch) = rs.next_row_batch(1).await? {
-            if let Some(row) = batch.rows.first() {
-                if let Some(val) = row.first() {
-                    let raw_str = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    
-                    let arr: serde_json::Value = serde_json::from_str(&raw_str)
-                        .map_err(|e| DatabaseError::new(format!("Failed to parse EXPLAIN JSON: {}", e)))?;
-                    
-                    let plan_val = &arr[0]["Plan"];
-                    if plan_val.is_null() {
-                        return Err(DatabaseError::new("Explain plan key not found".to_string()));
+        if let Some(row) = rows.first() {
+            let raw_str = if let Ok(val) = row.try_get::<_, String>(0) {
+                val
+            } else if let Ok(val) = row.try_get::<_, &str>(0) {
+                val.to_string()
+            } else if let Ok(val) = row.try_get::<_, serde_json::Value>(0) {
+                serde_json::to_string(&val).unwrap_or_default()
+            } else {
+                match row.try_get::<_, types::RawValue>(0) {
+                    Ok(raw_val) => {
+                        if !raw_val.0.is_empty() && raw_val.0[0] == 1 && row.columns()[0].type_().name() == "jsonb" {
+                            String::from_utf8_lossy(&raw_val.0[1..]).into_owned()
+                        } else {
+                            String::from_utf8_lossy(raw_val.0).into_owned()
+                        }
                     }
-                    
-                    let node: PlanNode = serde_json::from_value(plan_val.clone())
-                        .map_err(|e| DatabaseError::new(format!("Failed to deserialize PlanNode: {}", e)))?;
-                    
-                    return Ok(node);
+                    Err(e) => return Err(DatabaseError::new(format!("Failed to retrieve EXPLAIN result: {}", e))),
                 }
+            };
+
+            let arr: serde_json::Value = serde_json::from_str(&raw_str)
+                .map_err(|e| DatabaseError::new(format!("Failed to parse EXPLAIN JSON: {}", e)))?;
+            
+            let plan_val = if arr.is_array() {
+                &arr[0]["Plan"]
+            } else {
+                &arr["Plan"]
+            };
+
+            if plan_val.is_null() {
+                return Err(DatabaseError::new("Explain plan key not found".to_string()));
             }
+            
+            let node: PlanNode = serde_json::from_value(plan_val.clone())
+                .map_err(|e| DatabaseError::new(format!("Failed to deserialize PlanNode: {}", e)))?;
+            
+            return Ok(node);
         }
         Err(DatabaseError::new("Explain plan returned no results".to_string()))
     }
 
-    async fn list_active_sessions(&self) -> Result<Vec<DbSessionInfo>, DatabaseError> {
-        let ctx = self.open_context("utility").await?;
-        let session = ctx.open_session("utility").await?;
-        let stmt = session
-            .prepare_statement(
-                "SELECT \
-                    pid, \
-                    usename::text, \
-                    query::text, \
-                    state::text, \
-                    query_start::text, \
-                    client_addr::text \
-                 FROM pg_catalog.pg_stat_activity \
-                 WHERE backend_type = 'client backend'",
-            )
-            .await?;
-        let mut rs = stmt.execute_query().await?;
+    async fn list_active_sessions(&self, show_idle: bool) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+        let mut sql = "SELECT \
+                         pid, \
+                         usename::text, \
+                         query::text, \
+                         state::text, \
+                         query_start::text, \
+                         client_addr::text \
+                       FROM pg_catalog.pg_stat_activity \
+                       WHERE backend_type = 'client backend'".to_string();
+
+        if !show_idle {
+            sql.push_str(" AND (state IS NULL OR state NOT LIKE 'idle%')");
+        }
+
+        let rows = self.utility_context.client.query(&sql, &[]).await.map_err(map_db_error)?;
         let mut sessions = Vec::new();
-        while let Some(batch) = rs.next_row_batch(100).await? {
-            for row in batch.rows {
-                if row.len() >= 6 {
-                    let pid = match &row[0] {
-                        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
-                        _ => 0,
-                    };
-                    let username = match &row[1] {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                    let query = match &row[2] {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                    let state = match &row[3] {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                    let query_start = match &row[4] {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                    let client_addr = match &row[5] {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    };
-                    sessions.push(DbSessionInfo {
-                        pid,
-                        username,
-                        query,
-                        state,
-                        query_start,
-                        client_addr,
-                    });
-                }
-            }
+        for row in rows {
+            let pid: i32 = row.get(0);
+            let username: Option<String> = row.get(1);
+            let query: Option<String> = row.get(2);
+            let state: Option<String> = row.get(3);
+            let query_start: Option<String> = row.get(4);
+            let client_addr: Option<String> = row.get(5);
+
+            sessions.push(DbSessionInfo {
+                pid,
+                username,
+                query,
+                state,
+                query_start,
+                client_addr,
+            });
         }
         Ok(sessions)
     }
 
     async fn cancel_session(&self, pid: i32) -> Result<(), DatabaseError> {
-        let ctx = self.open_context("utility").await?;
-        let session = ctx.open_session("utility").await?;
+        let session = self.utility_context.open_session("utility").await?;
         let sql = format!("SELECT pg_catalog.pg_cancel_backend({})", pid);
         let stmt = session.prepare_statement(&sql).await?;
         let _ = stmt.execute_update().await?;
@@ -563,11 +689,255 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn terminate_session(&self, pid: i32) -> Result<(), DatabaseError> {
-        let ctx = self.open_context("utility").await?;
-        let session = ctx.open_session("utility").await?;
+        let session = self.utility_context.open_session("utility").await?;
         let sql = format!("SELECT pg_catalog.pg_terminate_backend({})", pid);
         let stmt = session.prepare_statement(&sql).await?;
         let _ = stmt.execute_update().await?;
+        Ok(())
+    }
+
+    async fn list_indexes(&self, schema: &str, table: &str) -> Result<Vec<IndexInfo>, DatabaseError> {
+        let rows = self.metadata_context.client.query(
+            "SELECT c.relname as index_name, \
+                    tc.relname as table_name, \
+                    i.indisunique as is_unique, \
+                    i.indisprimary as is_primary, \
+                    am.amname as index_type, \
+                    pg_catalog.pg_get_expr(i.indpred, i.indrelid) as predicate, \
+                    dsc.description, \
+                    ARRAY( \
+                      SELECT a.attname \
+                      FROM pg_catalog.pg_attribute a \
+                      WHERE a.attrelid = i.indrelid \
+                        AND a.attnum = ANY(i.indkey) \
+                      ORDER BY pg_catalog.array_position(i.indkey::int[], a.attnum) \
+                    ) as column_names \
+             FROM pg_catalog.pg_index i \
+             JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_catalog.pg_class tc ON tc.oid = i.indrelid \
+             JOIN pg_catalog.pg_namespace n ON tc.relnamespace = n.oid \
+             LEFT OUTER JOIN pg_catalog.pg_am am ON c.relam = am.oid \
+             LEFT OUTER JOIN pg_catalog.pg_description dsc ON i.indexrelid = dsc.objoid \
+             WHERE n.nspname = $1 AND tc.relname = $2 \
+             ORDER BY c.relname",
+            &[&schema, &table],
+        ).await.map_err(map_db_error)?;
+
+        let mut indexes = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            let table_name: String = row.get(1);
+            let is_unique: bool = row.get(2);
+            let is_primary: bool = row.get(3);
+            let index_type: Option<String> = row.get(4);
+            let predicate: Option<String> = row.get(5);
+            let description: Option<String> = row.get(6);
+            let columns: Vec<String> = row.get(7);
+
+            indexes.push(IndexInfo {
+                name,
+                table_name,
+                is_unique,
+                is_primary,
+                columns,
+                index_type,
+                predicate,
+                description,
+            });
+        }
+        Ok(indexes)
+    }
+
+    async fn list_constraints(&self, schema: &str, table: &str) -> Result<Vec<ConstraintInfo>, DatabaseError> {
+        let rows = self.metadata_context.client.query(
+            "SELECT con.conname, \
+                    tc.relname as table_name, \
+                    con.contype::text, \
+                    pg_catalog.pg_get_constraintdef(con.oid) as definition, \
+                    d.description, \
+                    ARRAY( \
+                      SELECT a.attname \
+                      FROM pg_catalog.pg_attribute a \
+                      WHERE a.attrelid = con.conrelid \
+                        AND a.attnum = ANY(con.conkey) \
+                      ORDER BY pg_catalog.array_position(con.conkey::int[], a.attnum) \
+                    ) as column_names \
+             FROM pg_catalog.pg_constraint con \
+             JOIN pg_catalog.pg_class tc ON tc.oid = con.conrelid \
+             JOIN pg_catalog.pg_namespace n ON tc.relnamespace = n.oid \
+             LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid = con.oid \
+             WHERE n.nspname = $1 AND tc.relname = $2 \
+             ORDER BY con.conname",
+            &[&schema, &table],
+        ).await.map_err(map_db_error)?;
+
+        let mut constraints = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            let table_name: String = row.get(1);
+            let contype_str: String = row.get(2);
+            let definition: String = row.get(3);
+            let description: Option<String> = row.get(4);
+            let columns: Vec<String> = row.get(5);
+
+            let constraint_type = match contype_str.as_str() {
+                "p" => ConstraintType::PrimaryKey,
+                "u" => ConstraintType::Unique,
+                "c" => ConstraintType::Check,
+                "x" => ConstraintType::Exclusion,
+                _ => ConstraintType::ForeignKey,
+            };
+
+            constraints.push(ConstraintInfo {
+                name,
+                table_name,
+                constraint_type,
+                columns,
+                definition,
+                description,
+            });
+        }
+        Ok(constraints)
+    }
+
+    async fn list_sequences(&self, schema: &str) -> Result<Vec<SequenceInfo>, DatabaseError> {
+        let rows = self.metadata_context.client.query(
+            "SELECT c.relname as name, \
+                    n.nspname as schema, \
+                    pg_catalog.format_type(s.seqtypid, null) as data_type, \
+                    s.seqstart as start_value, \
+                    s.seqmin as min_value, \
+                    s.seqmax as max_value, \
+                    s.seqincrement as increment, \
+                    d.description \
+             FROM pg_catalog.pg_sequence s \
+             JOIN pg_catalog.pg_class c ON s.seqrelid = c.oid \
+             JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+             LEFT OUTER JOIN pg_catalog.pg_description d ON c.oid = d.objoid \
+             WHERE n.nspname = $1 \
+             ORDER BY c.relname",
+            &[&schema],
+        ).await.map_err(map_db_error)?;
+
+        let mut sequences = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            let schema: String = row.get(1);
+            let data_type: String = row.get(2);
+            let start_value: i64 = row.get(3);
+            let min_value: i64 = row.get(4);
+            let max_value: i64 = row.get(5);
+            let increment: i64 = row.get(6);
+            let description: Option<String> = row.get(7);
+
+            sequences.push(SequenceInfo {
+                name,
+                schema,
+                data_type,
+                start_value,
+                min_value,
+                max_value,
+                increment,
+                description,
+            });
+        }
+        Ok(sequences)
+    }
+
+    async fn list_procedures(&self, schema: &str) -> Result<Vec<ProcedureInfo>, DatabaseError> {
+        let rows = self.metadata_context.client.query(
+            "SELECT p.proname as name, \
+                    n.nspname as schema, \
+                    pg_catalog.pg_get_function_arguments(p.oid) as argument_types_str, \
+                    pg_catalog.format_type(p.prorettype, null) as return_type, \
+                    p.prosrc as definition, \
+                    d.description \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid \
+             LEFT OUTER JOIN pg_catalog.pg_description d ON p.oid = d.objoid \
+             WHERE n.nspname = $1 \
+             ORDER BY p.proname",
+            &[&schema],
+        ).await.map_err(map_db_error)?;
+
+        let mut procedures = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            let schema: String = row.get(1);
+            let argument_types_str: String = row.get(2);
+            let return_type: String = row.get(3);
+            let definition: String = row.get(4);
+            let description: Option<String> = row.get(5);
+
+            let argument_types = argument_types_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            procedures.push(ProcedureInfo {
+                name,
+                schema,
+                argument_types,
+                return_type,
+                definition,
+                description,
+            });
+        }
+        Ok(procedures)
+    }
+
+    async fn list_extensions(&self) -> Result<Vec<ExtensionInfo>, DatabaseError> {
+        let rows = self.metadata_context.client.query(
+            "SELECT e.extname as name, \
+                    e.extversion as version, \
+                    n.nspname as schema, \
+                    pg_catalog.obj_description(e.oid, 'pg_extension') as description \
+             FROM pg_catalog.pg_extension e \
+             JOIN pg_catalog.pg_namespace n ON e.extnamespace = n.oid \
+             ORDER BY e.extname",
+            &[],
+        ).await.map_err(map_db_error)?;
+
+        let mut extensions = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            let version: String = row.get(1);
+            let schema: String = row.get(2);
+            let description: Option<String> = row.get(3);
+
+            extensions.push(ExtensionInfo {
+                name,
+                version,
+                schema,
+                description,
+            });
+        }
+        Ok(extensions)
+    }
+
+    async fn get_view_ddl(&self, schema: &str, view: &str) -> Result<String, DatabaseError> {
+        let rows = self.metadata_context.client.query(
+            "SELECT pg_catalog.pg_get_viewdef(c.oid, true) as definition \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('v', 'm')",
+            &[&schema, &view],
+        ).await.map_err(map_db_error)?;
+
+        if let Some(row) = rows.first() {
+            let definition: String = row.get(0);
+            Ok(format!("CREATE OR REPLACE VIEW {}.{} AS\n{}", schema, view, definition))
+        } else {
+            Err(DatabaseError::new("View not found".to_string()))
+        }
+    }
+
+    async fn refresh_all(&self) -> Result<(), DatabaseError> {
+        self.schema_cache.clear().await;
+        self.table_cache.clear().await;
+        self.column_cache.clear().await;
+        self.graph_cache.clear().await;
         Ok(())
     }
 }

@@ -21,9 +21,14 @@ pub fn map_db_error(e: tokio_postgres::Error) -> DatabaseError {
         };
 
         let category = match sql_state.as_str() {
+            "57014" => ErrorCategory::ExecutionCanceled,
+            "57P01" => ErrorCategory::ConnectionLost,
+            "25P02" => ErrorCategory::TransactionAborted,
+            "42501" => ErrorCategory::PermissionDenied,
             s if s.starts_with("42") => ErrorCategory::SyntaxError,
-            s if s.starts_with("28") => ErrorCategory::PermissionDenied,
+            "23505" => ErrorCategory::UniqueKeyViolation,
             s if s.starts_with("23") => ErrorCategory::IntegrityConstraintViolation,
+            s if s.starts_with("28") => ErrorCategory::AuthenticationFailed,
             s if s.starts_with("08") => ErrorCategory::ConnectionFailure,
             _ => ErrorCategory::Unknown,
         };
@@ -49,9 +54,11 @@ pub fn map_db_error(e: tokio_postgres::Error) -> DatabaseError {
 }
 
 pub struct PostgresExecutionContext {
-    client: Arc<Client>,
-    active_schema: tokio::sync::Mutex<String>,
-    pub type_registry: Arc<CustomTypeRegistry>,
+    pub(crate) client: Arc<Client>,
+    pub(crate) active_schema: tokio::sync::Mutex<String>,
+    pub(crate) type_registry: Arc<CustomTypeRegistry>,
+    pub(crate) in_transaction: tokio::sync::Mutex<bool>,
+    pub(crate) auto_commit: tokio::sync::Mutex<bool>,
 }
 
 impl PostgresExecutionContext {
@@ -70,11 +77,67 @@ impl PostgresExecutionContext {
             client,
             active_schema: tokio::sync::Mutex::new(active_schema),
             type_registry,
+            in_transaction: tokio::sync::Mutex::new(false),
+            auto_commit: tokio::sync::Mutex::new(true),
         })
     }
 
     pub fn cancel_token(&self) -> tokio_postgres::CancelToken {
         self.client.cancel_token()
+    }
+}
+
+#[async_trait]
+impl driver_api::TransactionManager for PostgresExecutionContext {
+    async fn is_auto_commit(&self) -> Result<bool, DatabaseError> {
+        let ac = self.auto_commit.lock().await;
+        Ok(*ac)
+    }
+
+    async fn set_auto_commit(&self, enabled: bool) -> Result<(), DatabaseError> {
+        let mut ac = self.auto_commit.lock().await;
+        let mut in_tx = self.in_transaction.lock().await;
+        if *ac != enabled {
+            *ac = enabled;
+            if !enabled {
+                self.client.execute("BEGIN", &[]).await.map_err(map_db_error)?;
+                *in_tx = true;
+            } else {
+                if *in_tx {
+                    self.client.execute("COMMIT", &[]).await.map_err(map_db_error)?;
+                    *in_tx = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn commit(&self) -> Result<(), DatabaseError> {
+        let ac = self.auto_commit.lock().await;
+        let mut in_tx = self.in_transaction.lock().await;
+        if *in_tx {
+            self.client.execute("COMMIT", &[]).await.map_err(map_db_error)?;
+            *in_tx = false;
+        }
+        if !*ac {
+            self.client.execute("BEGIN", &[]).await.map_err(map_db_error)?;
+            *in_tx = true;
+        }
+        Ok(())
+    }
+
+    async fn rollback(&self) -> Result<(), DatabaseError> {
+        let ac = self.auto_commit.lock().await;
+        let mut in_tx = self.in_transaction.lock().await;
+        if *in_tx {
+            self.client.execute("ROLLBACK", &[]).await.map_err(map_db_error)?;
+            *in_tx = false;
+        }
+        if !*ac {
+            self.client.execute("BEGIN", &[]).await.map_err(map_db_error)?;
+            *in_tx = true;
+        }
+        Ok(())
     }
 }
 
@@ -86,9 +149,13 @@ impl ExecutionContext for PostgresExecutionContext {
     }
 
     async fn set_active_schema(&self, schema: &str) -> Result<(), DatabaseError> {
-        let quoted = PostgreDialect.quote_identifier(schema);
+        let mut search_path = self.get_search_path().await?;
+        let quoted = PostgreDialect::default().quote_identifier(schema);
+        search_path.retain(|s| s != schema);
+        search_path.insert(0, quoted);
+        let path_str = search_path.join(", ");
         self.client
-            .execute(&format!("SET search_path TO {}", quoted), &[])
+            .execute(&format!("SET search_path TO {}", path_str), &[])
             .await
             .map_err(map_db_error)?;
         let mut active = self.active_schema.lock().await;
@@ -119,6 +186,10 @@ impl ExecutionContext for PostgresExecutionContext {
             client: self.client.clone(),
             type_registry: self.type_registry.clone(),
         }))
+    }
+
+    fn transaction_manager(&self) -> Option<&dyn driver_api::TransactionManager> {
+        Some(self)
     }
 }
 
@@ -165,6 +236,10 @@ impl DbStatement for PostgresStatement {
             .map(|c| ColumnInfo {
                 name: c.name().to_string(),
                 data_type: c.type_().name().to_string(),
+                is_nullable: true,
+                default_value: None,
+                description: None,
+                type_oid: c.type_().oid(),
             })
             .collect();
 
@@ -172,6 +247,7 @@ impl DbStatement for PostgresStatement {
             columns,
             stream: tokio::sync::Mutex::new(Box::pin(row_stream)),
             type_registry: self.type_registry.clone(),
+            exhausted: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -204,6 +280,7 @@ pub struct PostgresResultSet {
         >,
     >,
     type_registry: Arc<CustomTypeRegistry>,
+    exhausted: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -213,6 +290,10 @@ impl DbResultSet for PostgresResultSet {
     }
 
     async fn next_row_batch(&mut self, batch_size: usize) -> Result<Option<RowBatch>, DatabaseError> {
+        if self.exhausted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
+
         let mut stream = self.stream.lock().await;
         let mut rows = Vec::new();
 
@@ -226,7 +307,10 @@ impl DbResultSet for PostgresResultSet {
                     rows.push(row_values);
                 }
                 Some(Err(e)) => return Err(map_db_error(e)),
-                None => break,
+                None => {
+                    self.exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
             }
         }
 

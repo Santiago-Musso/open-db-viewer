@@ -1,6 +1,17 @@
 use driver_api::SqlDialect;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct PostgreDialect;
+pub struct PostgreDialect {
+    pub(crate) standard_conforming_strings: AtomicBool,
+}
+
+impl Default for PostgreDialect {
+    fn default() -> Self {
+        Self {
+            standard_conforming_strings: AtomicBool::new(true),
+        }
+    }
+}
 
 impl SqlDialect for PostgreDialect {
     fn quote_identifier(&self, ident: &str) -> String {
@@ -16,7 +27,11 @@ impl SqlDialect for PostgreDialect {
     }
 
     fn escape_string_literal(&self, val: &str) -> String {
-        val.replace("'", "''")
+        if self.standard_conforming_strings.load(Ordering::SeqCst) {
+            val.replace("'", "''")
+        } else {
+            val.replace('\\', "\\\\").replace("'", "''")
+        }
     }
 
     fn get_type_cast_clause(&self, column_type: &str) -> Option<String> {
@@ -29,7 +44,10 @@ impl SqlDialect for PostgreDialect {
     }
 
     fn transform_query_limit(&self, sql: &str, limit: usize, offset: Option<usize>) -> String {
-        let trimmed = sql.trim();
+        let mut trimmed = sql.trim();
+        if trimmed.ends_with(';') {
+            trimmed = trimmed[..trimmed.len() - 1].trim();
+        }
         let lower = trimmed.to_lowercase();
         if lower.starts_with("select") || lower.starts_with("with") {
             if let Some(off) = offset {
@@ -52,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_quote_identifier() {
-        let dialect = PostgreDialect;
+        let dialect = PostgreDialect::default();
         assert_eq!(dialect.quote_identifier("users"), "\"users\"");
         assert_eq!(dialect.quote_identifier("public.users"), "\"public\".\"users\"");
         assert_eq!(
@@ -63,14 +81,18 @@ mod tests {
 
     #[test]
     fn test_escape_string_literal() {
-        let dialect = PostgreDialect;
+        let dialect = PostgreDialect::default();
         assert_eq!(dialect.escape_string_literal("hello"), "hello");
         assert_eq!(dialect.escape_string_literal("O'Connor"), "O''Connor");
     }
 
     #[test]
     fn test_transform_query_limit() {
-        let dialect = PostgreDialect;
+        let dialect = PostgreDialect::default();
+        assert_eq!(
+            dialect.transform_query_limit("SELECT * FROM users;", 10, None),
+            "SELECT * FROM (SELECT * FROM users) AS _odv_wrapper LIMIT 10"
+        );
         assert_eq!(
             dialect.transform_query_limit("SELECT * FROM users", 10, None),
             "SELECT * FROM (SELECT * FROM users) AS _odv_wrapper LIMIT 10"

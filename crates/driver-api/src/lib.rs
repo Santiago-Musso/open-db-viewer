@@ -36,16 +36,40 @@ pub struct SchemaInfo {
     pub name: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Regular,
+    Partitioned,
+    Foreign,
+    View,
+    MaterializedView,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TableStats {
+    pub table_size: i64,
+    pub total_size: i64,
+    pub estimated_row_count: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableInfo {
     pub schema: String,
     pub name: String,
+    pub oid: u64,
+    pub table_kind: TableKind,
+    pub description: Option<String>,
+    pub stats: Option<TableStats>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
+    pub is_nullable: bool,
+    pub default_value: Option<String>,
+    pub description: Option<String>,
+    pub type_oid: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -74,12 +98,94 @@ pub struct SchemaEdge {
     pub target: String,
     pub source_handle: String,
     pub target_handle: String,
+    pub match_type: Option<String>,     // FULL, PARTIAL, SIMPLE
+    pub update_rule: Option<String>,    // CASCADE, RESTRICT, SET_NULL, SET_DEFAULT, NO_ACTION
+    pub delete_rule: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SchemaGraph {
     pub nodes: Vec<SchemaNode>,
     pub edges: Vec<SchemaEdge>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub table_name: String,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub columns: Vec<String>,
+    pub index_type: Option<String>,  // btree, hash, gist, gin, etc.
+    pub predicate: Option<String>,   // partial index expression
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintType {
+    PrimaryKey,
+    Unique,
+    Check,
+    Exclusion,
+    ForeignKey,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ConstraintInfo {
+    pub name: String,
+    pub table_name: String,
+    pub constraint_type: ConstraintType,
+    pub columns: Vec<String>,
+    pub definition: String,               // from pg_get_constraintdef
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SequenceInfo {
+    pub name: String,
+    pub schema: String,
+    pub data_type: String,
+    pub start_value: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub increment: i64,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProcedureInfo {
+    pub name: String,
+    pub schema: String,
+    pub argument_types: Vec<String>,
+    pub return_type: String,
+    pub definition: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExtensionInfo {
+    pub name: String,
+    pub version: String,
+    pub schema: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub struct ExplainOptions {
+    pub analyze: bool,
+    pub verbose: bool,
+    pub costs: bool,
+    pub buffers: bool,
+    pub timing: bool,
+    pub settings: bool,
+}
+
+#[async_trait]
+pub trait TransactionManager: Send + Sync {
+    async fn is_auto_commit(&self) -> Result<bool, DatabaseError>;
+    async fn set_auto_commit(&self, enabled: bool) -> Result<(), DatabaseError>;
+    async fn commit(&self) -> Result<(), DatabaseError>;
+    async fn rollback(&self) -> Result<(), DatabaseError>;
 }
 
 pub trait SqlDialect: Send + Sync {
@@ -103,6 +209,9 @@ pub trait ExecutionContext: Send + Sync {
     async fn set_active_schema(&self, schema: &str) -> Result<(), DatabaseError>;
     async fn get_search_path(&self) -> Result<Vec<String>, DatabaseError>;
     async fn open_session(&self, purpose: &str) -> Result<Box<dyn DbSession>, DatabaseError>;
+    fn transaction_manager(&self) -> Option<&dyn TransactionManager> {
+        None
+    }
 }
 
 #[async_trait]
@@ -145,10 +254,10 @@ pub trait RelationalDriver: Send + Sync {
     async fn refresh_table(&self, _schema: &str, _table: &str) -> Result<(), DatabaseError> {
         Ok(())
     }
-    async fn get_execution_plan(&self, _sql: &str) -> Result<PlanNode, DatabaseError> {
+    async fn get_execution_plan(&self, _sql: &str, _options: ExplainOptions) -> Result<PlanNode, DatabaseError> {
         Err(DatabaseError::new("Explain plan is not supported by this driver".to_string()))
     }
-    async fn list_active_sessions(&self) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+    async fn list_active_sessions(&self, _show_idle: bool) -> Result<Vec<DbSessionInfo>, DatabaseError> {
         Err(DatabaseError::new("Session management is not supported by this driver".to_string()))
     }
     async fn cancel_session(&self, _pid: i32) -> Result<(), DatabaseError> {
@@ -156,6 +265,27 @@ pub trait RelationalDriver: Send + Sync {
     }
     async fn terminate_session(&self, _pid: i32) -> Result<(), DatabaseError> {
         Err(DatabaseError::new("Session termination is not supported by this driver".to_string()))
+    }
+    async fn list_indexes(&self, _schema: &str, _table: &str) -> Result<Vec<IndexInfo>, DatabaseError> {
+        Ok(Vec::new())
+    }
+    async fn list_constraints(&self, _schema: &str, _table: &str) -> Result<Vec<ConstraintInfo>, DatabaseError> {
+        Ok(Vec::new())
+    }
+    async fn list_sequences(&self, _schema: &str) -> Result<Vec<SequenceInfo>, DatabaseError> {
+        Ok(Vec::new())
+    }
+    async fn list_procedures(&self, _schema: &str) -> Result<Vec<ProcedureInfo>, DatabaseError> {
+        Ok(Vec::new())
+    }
+    async fn list_extensions(&self) -> Result<Vec<ExtensionInfo>, DatabaseError> {
+        Ok(Vec::new())
+    }
+    async fn get_view_ddl(&self, _schema: &str, _view: &str) -> Result<String, DatabaseError> {
+        Err(DatabaseError::new("Views not supported by this driver".to_string()))
+    }
+    async fn refresh_all(&self) -> Result<(), DatabaseError> {
+        Ok(())
     }
 }
 

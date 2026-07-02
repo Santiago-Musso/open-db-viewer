@@ -5,7 +5,12 @@ pub enum ErrorCategory {
     SyntaxError,
     PermissionDenied,
     IntegrityConstraintViolation,
+    UniqueKeyViolation,
     ConnectionFailure,
+    ConnectionLost,
+    ExecutionCanceled,
+    TransactionAborted,
+    AuthenticationFailed,
     Unknown,
 }
 

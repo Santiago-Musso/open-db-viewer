@@ -4,7 +4,7 @@ mod state;
 
 use driver_api::{
     ConnectionConfig, KeyValue, ScanResult, SchemaGraph, SchemaInfo, ServerInfo, TableInfo,
-    TableSchema, DatabaseError, PlanNode, DbSessionInfo,
+    TableSchema, DatabaseError, PlanNode, DbSessionInfo, ExplainOptions,
 };
 use state::AppState;
 use std::fs::File;
@@ -68,14 +68,8 @@ async fn list_schemas(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> Result<Vec<SchemaInfo>, DatabaseError> {
-    println!(
-        "DEBUG: list_schemas called for connection: {}",
-        connection_id
-    );
     let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
-    let res = driver.list_schemas().await;
-    println!("DEBUG: list_schemas result: {:?}", res);
-    res
+    driver.list_schemas().await
 }
 
 #[tauri::command]
@@ -197,6 +191,8 @@ async fn refresh_metadata_cache(
         }
     } else if let Some(sch) = schema {
         driver.refresh_schema(&sch).await?;
+    } else {
+        driver.refresh_all().await?;
     }
     Ok(())
 }
@@ -206,18 +202,28 @@ async fn get_execution_plan(
     state: State<'_, AppState>,
     connection_id: String,
     sql: String,
+    options: Option<ExplainOptions>,
 ) -> Result<PlanNode, DatabaseError> {
     let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
-    driver.get_execution_plan(&sql).await
+    let opts = options.unwrap_or(ExplainOptions {
+        analyze: false,
+        verbose: false,
+        costs: true,
+        buffers: false,
+        timing: false,
+        settings: false,
+    });
+    driver.get_execution_plan(&sql, opts).await
 }
 
 #[tauri::command]
 async fn list_active_sessions(
     state: State<'_, AppState>,
     connection_id: String,
+    show_idle: Option<bool>,
 ) -> Result<Vec<DbSessionInfo>, DatabaseError> {
     let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
-    driver.list_active_sessions().await
+    driver.list_active_sessions(show_idle.unwrap_or(false)).await
 }
 
 #[tauri::command]
