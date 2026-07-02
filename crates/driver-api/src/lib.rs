@@ -136,6 +136,12 @@ pub trait RelationalDriver: Send + Sync {
         offset: Option<usize>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, String>> + Send>>, String>;
     async fn cancel_query(&self, query_id: &str) -> Result<(), String>;
+    async fn refresh_schema(&self, _schema: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn refresh_table(&self, _schema: &str, _table: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

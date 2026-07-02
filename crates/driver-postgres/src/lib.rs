@@ -12,6 +12,7 @@ use tokio_postgres::NoTls;
 
 pub mod connection;
 pub mod dialect;
+pub mod metadata;
 pub mod types;
 
 use connection::PostgresExecutionContext;
@@ -21,6 +22,12 @@ pub struct PostgresDriver {
     metadata_context: Arc<PostgresExecutionContext>,
     utility_context: Arc<PostgresExecutionContext>,
     dialect: Arc<dialect::PostgreDialect>,
+
+    schema_cache: metadata::ObjectLookupCache<(), Vec<SchemaInfo>>,
+    table_cache: metadata::ObjectLookupCache<String, Vec<TableInfo>>,
+    column_cache: metadata::ObjectLookupCache<(String, String), TableSchema>,
+    graph_cache: metadata::ObjectLookupCache<String, SchemaGraph>,
+
     _connection_tasks: Vec<tokio::task::JoinHandle<()>>,
     cancel_tokens: Arc<Mutex<HashMap<String, tokio_postgres::CancelToken>>>,
 }
@@ -77,11 +84,20 @@ impl PostgresDriver {
         let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc).await?);
         let dialect = Arc::new(dialect::PostgreDialect);
 
+        let schema_cache = metadata::ObjectLookupCache::new();
+        let table_cache = metadata::ObjectLookupCache::new();
+        let column_cache = metadata::ObjectLookupCache::new();
+        let graph_cache = metadata::ObjectLookupCache::new();
+
         Ok(Self {
             main_context,
             metadata_context,
             utility_context,
             dialect,
+            schema_cache,
+            table_cache,
+            column_cache,
+            graph_cache,
             _connection_tasks: vec![main_task, metadata_task, utility_task],
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -125,93 +141,106 @@ impl DataSource for PostgresDriver {
 #[async_trait]
 impl RelationalDriver for PostgresDriver {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, String> {
-        let ctx = self.open_context("metadata").await?;
-        let session = ctx.open_session("metadata").await?;
-        let stmt = session
-            .prepare_statement(
-                "SELECT schema_name FROM information_schema.schemata \
-                 WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
-                 ORDER BY schema_name",
-            )
-            .await?;
-        let mut rs = stmt.execute_query().await?;
+        let val = self.schema_cache.get_or_load((), || async {
+            let ctx = self.open_context("metadata").await?;
+            let session = ctx.open_session("metadata").await?;
+            let stmt = session
+                .prepare_statement(
+                    "SELECT schema_name FROM information_schema.schemata \
+                     WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY schema_name",
+                )
+                .await?;
+            let mut rs = stmt.execute_query().await?;
 
-        let mut schemas = Vec::new();
-        while let Some(batch) = rs.next_row_batch(100).await? {
-            for row in batch.rows {
-                if let Some(serde_json::Value::String(name)) = row.first() {
-                    schemas.push(SchemaInfo { name: name.clone() });
+            let mut schemas = Vec::new();
+            while let Some(batch) = rs.next_row_batch(100).await? {
+                for row in batch.rows {
+                    if let Some(serde_json::Value::String(name)) = row.first() {
+                        schemas.push(SchemaInfo { name: name.clone() });
+                    }
                 }
             }
-        }
-        Ok(schemas)
+            Ok(schemas)
+        }).await?;
+        Ok((*val).clone())
     }
 
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, String> {
-        let ctx = self.open_context("metadata").await?;
-        let session = ctx.open_session("metadata").await?;
-        let escaped_schema = schema.replace("'", "''");
-        let sql = format!(
-            "SELECT table_schema, table_name FROM information_schema.tables \
-             WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
-             ORDER BY table_name",
-            escaped_schema
-        );
-        let stmt = session.prepare_statement(&sql).await?;
-        let mut rs = stmt.execute_query().await?;
+        let schema_owned = schema.to_string();
+        let loader_schema = schema_owned.clone();
+        let val = self.table_cache.get_or_load(schema_owned, || async move {
+            let ctx = self.open_context("metadata").await?;
+            let session = ctx.open_session("metadata").await?;
+            let escaped_schema = self.dialect.escape_string_literal(&loader_schema);
+            let sql = format!(
+                "SELECT table_schema, table_name FROM information_schema.tables \
+                 WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
+                 ORDER BY table_name",
+                escaped_schema
+            );
+            let stmt = session.prepare_statement(&sql).await?;
+            let mut rs = stmt.execute_query().await?;
 
-        let mut tables = Vec::new();
-        while let Some(batch) = rs.next_row_batch(100).await? {
-            for row in batch.rows {
-                if row.len() >= 2 {
-                    if let (
-                        serde_json::Value::String(schema_val),
-                        serde_json::Value::String(name_val),
-                    ) = (&row[0], &row[1])
-                    {
-                        tables.push(TableInfo {
-                            schema: schema_val.clone(),
-                            name: name_val.clone(),
-                        });
+            let mut tables = Vec::new();
+            while let Some(batch) = rs.next_row_batch(100).await? {
+                for row in batch.rows {
+                    if row.len() >= 2 {
+                        if let (
+                            serde_json::Value::String(schema_val),
+                            serde_json::Value::String(name_val),
+                        ) = (&row[0], &row[1])
+                        {
+                            tables.push(TableInfo {
+                                schema: schema_val.clone(),
+                                name: name_val.clone(),
+                            });
+                        }
                     }
                 }
             }
-        }
-        Ok(tables)
+            Ok(tables)
+        }).await?;
+        Ok((*val).clone())
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, String> {
-        let ctx = self.open_context("metadata").await?;
-        let session = ctx.open_session("metadata").await?;
-        let escaped_schema = schema.replace("'", "''");
-        let escaped_table = table.replace("'", "''");
-        let sql = format!(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_schema = '{}' AND table_name = '{}' \
-             ORDER BY ordinal_position",
-            escaped_schema, escaped_table
-        );
-        let stmt = session.prepare_statement(&sql).await?;
-        let mut rs = stmt.execute_query().await?;
+        let key = (schema.to_string(), table.to_string());
+        let loader_key = key.clone();
+        let val = self.column_cache.get_or_load(key, || async move {
+            let ctx = self.open_context("metadata").await?;
+            let session = ctx.open_session("metadata").await?;
+            let escaped_schema = self.dialect.escape_string_literal(&loader_key.0);
+            let escaped_table = self.dialect.escape_string_literal(&loader_key.1);
+            let sql = format!(
+                "SELECT column_name, data_type FROM information_schema.columns \
+                 WHERE table_schema = '{}' AND table_name = '{}' \
+                 ORDER BY ordinal_position",
+                escaped_schema, escaped_table
+            );
+            let stmt = session.prepare_statement(&sql).await?;
+            let mut rs = stmt.execute_query().await?;
 
-        let mut columns = Vec::new();
-        while let Some(batch) = rs.next_row_batch(100).await? {
-            for row in batch.rows {
-                if row.len() >= 2 {
-                    if let (
-                        serde_json::Value::String(name_val),
-                        serde_json::Value::String(data_type_val),
-                    ) = (&row[0], &row[1])
-                    {
-                        columns.push(ColumnInfo {
-                            name: name_val.clone(),
-                            data_type: data_type_val.clone(),
-                        });
+            let mut columns = Vec::new();
+            while let Some(batch) = rs.next_row_batch(100).await? {
+                for row in batch.rows {
+                    if row.len() >= 2 {
+                        if let (
+                            serde_json::Value::String(name_val),
+                            serde_json::Value::String(data_type_val),
+                        ) = (&row[0], &row[1])
+                        {
+                            columns.push(ColumnInfo {
+                                name: name_val.clone(),
+                                data_type: data_type_val.clone(),
+                            });
+                        }
                     }
                 }
             }
-        }
-        Ok(TableSchema { columns })
+            Ok(TableSchema { columns })
+        }).await?;
+        Ok((*val).clone())
     }
 
     async fn get_table_ddl(&self, schema: &str, table: &str) -> Result<String, String> {
@@ -228,101 +257,106 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, String> {
-        let ctx = self.open_context("metadata").await?;
-        let session = ctx.open_session("metadata").await?;
-        let escaped_schema = schema.replace("'", "''");
+        let schema_owned = schema.to_string();
+        let loader_schema = schema_owned.clone();
+        let val = self.graph_cache.get_or_load(schema_owned, || async move {
+            let ctx = self.open_context("metadata").await?;
+            let session = ctx.open_session("metadata").await?;
+            let escaped_schema = self.dialect.escape_string_literal(&loader_schema);
 
-        let col_sql = format!(
-            "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type \
-             FROM pg_class c \
-             JOIN pg_namespace n ON c.relnamespace = n.oid \
-             JOIN pg_attribute a ON a.attrelid = c.oid \
-             JOIN pg_type t ON a.atttypid = t.oid \
-             WHERE n.nspname = '{}' \
-               AND c.relkind = 'r' \
-               AND a.attnum > 0 \
-               AND NOT a.attisdropped \
-             ORDER BY c.relname, a.attnum",
-            escaped_schema
-        );
-        let col_stmt = session.prepare_statement(&col_sql).await?;
-        let mut col_rs = col_stmt.execute_query().await?;
+            let col_sql = format!(
+                "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON c.relnamespace = n.oid \
+                 JOIN pg_attribute a ON a.attrelid = c.oid \
+                 JOIN pg_type t ON a.atttypid = t.oid \
+                 WHERE n.nspname = '{}' \
+                   AND c.relkind = 'r' \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                 ORDER BY c.relname, a.attnum",
+                escaped_schema
+            );
+            let col_stmt = session.prepare_statement(&col_sql).await?;
+            let mut col_rs = col_stmt.execute_query().await?;
 
-        let mut table_map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
-        while let Some(batch) = col_rs.next_row_batch(100).await? {
-            for row in batch.rows {
-                if row.len() >= 3 {
-                    if let (
-                        serde_json::Value::String(table_name),
-                        serde_json::Value::String(col_name),
-                        serde_json::Value::String(data_type),
-                    ) = (&row[0], &row[1], &row[2])
-                    {
-                        table_map
-                            .entry(table_name.clone())
-                            .or_default()
-                            .push(ColumnInfo {
-                                name: col_name.clone(),
-                                data_type: data_type.clone(),
+            let mut table_map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
+            while let Some(batch) = col_rs.next_row_batch(100).await? {
+                for row in batch.rows {
+                    if row.len() >= 3 {
+                        if let (
+                            serde_json::Value::String(table_name),
+                            serde_json::Value::String(col_name),
+                            serde_json::Value::String(data_type),
+                        ) = (&row[0], &row[1], &row[2])
+                        {
+                            table_map
+                                .entry(table_name.clone())
+                                .or_default()
+                                .push(ColumnInfo {
+                                    name: col_name.clone(),
+                                    data_type: data_type.clone(),
+                                });
+                        }
+                    }
+                }
+            }
+
+            let nodes: Vec<SchemaNode> = table_map
+                .into_iter()
+                .map(|(name, columns)| SchemaNode {
+                    id: name.clone(),
+                    label: name,
+                    columns,
+                })
+                .collect();
+
+            let fk_sql = format!(
+                "SELECT \
+                    c.conname, \
+                    cl1.relname, \
+                    a1.attname, \
+                    cl2.relname, \
+                    a2.attname \
+                 FROM pg_constraint c \
+                 JOIN pg_class cl1 ON c.conrelid = cl1.oid \
+                 JOIN pg_class cl2 ON c.confrelid = cl2.oid \
+                 JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid \
+                 JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid \
+                 JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid \
+                 WHERE c.contype = 'f' AND n1.nspname = '{}'",
+                escaped_schema
+            );
+            let fk_stmt = session.prepare_statement(&fk_sql).await?;
+            let mut fk_rs = fk_stmt.execute_query().await?;
+
+            let mut edges = Vec::new();
+            while let Some(batch) = fk_rs.next_row_batch(100).await? {
+                for row in batch.rows {
+                    if row.len() >= 5 {
+                        if let (
+                            serde_json::Value::String(conname),
+                            serde_json::Value::String(table1),
+                            serde_json::Value::String(col1),
+                            serde_json::Value::String(table2),
+                            serde_json::Value::String(col2),
+                        ) = (&row[0], &row[1], &row[2], &row[3], &row[4])
+                        {
+                            edges.push(SchemaEdge {
+                                id: conname.clone(),
+                                source: table1.clone(),
+                                source_handle: col1.clone(),
+                                target: table2.clone(),
+                                target_handle: col2.clone(),
                             });
+                        }
                     }
                 }
             }
-        }
 
-        let nodes: Vec<SchemaNode> = table_map
-            .into_iter()
-            .map(|(name, columns)| SchemaNode {
-                id: name.clone(),
-                label: name,
-                columns,
-            })
-            .collect();
-
-        let fk_sql = format!(
-            "SELECT \
-                c.conname, \
-                cl1.relname, \
-                a1.attname, \
-                cl2.relname, \
-                a2.attname \
-             FROM pg_constraint c \
-             JOIN pg_class cl1 ON c.conrelid = cl1.oid \
-             JOIN pg_class cl2 ON c.confrelid = cl2.oid \
-             JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid \
-             JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid \
-             JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid \
-             WHERE c.contype = 'f' AND n1.nspname = '{}'",
-            escaped_schema
-        );
-        let fk_stmt = session.prepare_statement(&fk_sql).await?;
-        let mut fk_rs = fk_stmt.execute_query().await?;
-
-        let mut edges = Vec::new();
-        while let Some(batch) = fk_rs.next_row_batch(100).await? {
-            for row in batch.rows {
-                if row.len() >= 5 {
-                    if let (
-                        serde_json::Value::String(conname),
-                        serde_json::Value::String(table1),
-                        serde_json::Value::String(col1),
-                        serde_json::Value::String(table2),
-                        serde_json::Value::String(col2),
-                    ) = (&row[0], &row[1], &row[2], &row[3], &row[4])
-                    {
-                        edges.push(SchemaEdge {
-                            id: conname.clone(),
-                            source: table1.clone(),
-                            source_handle: col1.clone(),
-                            target: table2.clone(),
-                            target_handle: col2.clone(),
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(SchemaGraph { nodes, edges })
+            Ok(SchemaGraph { nodes, edges })
+        }).await?;
+        Ok((*val).clone())
     }
 
     async fn execute_query_stream(
@@ -382,6 +416,20 @@ impl RelationalDriver for PostgresDriver {
         }
         Ok(())
     }
+
+    async fn refresh_schema(&self, schema: &str) -> Result<(), String> {
+        self.table_cache.invalidate(&schema.to_string()).await;
+        self.graph_cache.invalidate(&schema.to_string()).await;
+        let mut write = self.column_cache.cache.write().await;
+        write.retain(|(s, _), _| s != schema);
+        Ok(())
+    }
+
+    async fn refresh_table(&self, schema: &str, table: &str) -> Result<(), String> {
+        self.column_cache.invalidate(&(schema.to_string(), table.to_string())).await;
+        self.graph_cache.invalidate(&schema.to_string()).await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -403,4 +451,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
