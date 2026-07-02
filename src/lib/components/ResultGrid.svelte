@@ -78,19 +78,21 @@
         overscan: 10,
       });
     });
-    
-    // Infinite scrolling detection
-    const items = $virtualizer.getVirtualItems();
-    if (items.length > 0) {
-      const lastItem = items[items.length - 1];
-      const tab = appState.activeTab;
-      if (tab && !tab.loading && !tab.isFullyLoaded && lastItem.index >= rows.length - 5) {
-        untrack(() => {
-          appState.executeQuery(true);
-        });
-      }
-    }
   });
+
+  // Infinite scrolling via scroll event (not $effect, to avoid reactive loops)
+  function handleScroll(e: Event) {
+    const el = e.target as HTMLDivElement;
+    if (!el) return;
+    const tab = appState.activeTab;
+    if (!tab || tab.loading || tab.isFullyLoaded) return;
+    
+    // Trigger fetch when scrolled within 200px of the bottom
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 200) {
+      appState.executeQuery(true);
+    }
+  }
 
   let columnTemplate = $derived(columnWidths.map(w => `${Math.max(50, w)}px`).join(' '));
   let totalWidth = $derived(columnWidths.reduce((a, b) => a + Math.max(50, b), 0));
@@ -226,6 +228,7 @@
     <div 
       class="scroll-container" 
       bind:this={containerEl}
+      onscroll={handleScroll}
     >
       <div 
         class="inner-container" 
