@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use driver_api::{
     ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
     SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema, SqlDialect,
-    DatabaseError,
+    DatabaseError, PlanNode,
 };
 use futures_util::Stream;
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use tokio_postgres::NoTls;
 pub mod connection;
 pub mod dialect;
 pub mod metadata;
+pub mod plan;
 pub mod types;
 
 use connection::PostgresExecutionContext;
@@ -457,6 +458,40 @@ impl RelationalDriver for PostgresDriver {
         self.column_cache.invalidate(&(schema.to_string(), table.to_string())).await;
         self.graph_cache.invalidate(&schema.to_string()).await;
         Ok(())
+    }
+
+    async fn get_execution_plan(&self, sql: &str) -> Result<PlanNode, DatabaseError> {
+        let ctx = self.open_context("utility").await?;
+        let session = ctx.open_session("utility").await?;
+        
+        let explain_sql = format!("EXPLAIN (FORMAT JSON) {}", sql);
+        let stmt = session.prepare_statement(&explain_sql).await?;
+        let mut rs = stmt.execute_query().await?;
+        
+        if let Some(batch) = rs.next_row_batch(1).await? {
+            if let Some(row) = batch.rows.first() {
+                if let Some(val) = row.first() {
+                    let raw_str = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    
+                    let arr: serde_json::Value = serde_json::from_str(&raw_str)
+                        .map_err(|e| DatabaseError::new(format!("Failed to parse EXPLAIN JSON: {}", e)))?;
+                    
+                    let plan_val = &arr[0]["Plan"];
+                    if plan_val.is_null() {
+                        return Err(DatabaseError::new("Explain plan key not found".to_string()));
+                    }
+                    
+                    let node: PlanNode = serde_json::from_value(plan_val.clone())
+                        .map_err(|e| DatabaseError::new(format!("Failed to deserialize PlanNode: {}", e)))?;
+                    
+                    return Ok(node);
+                }
+            }
+        }
+        Err(DatabaseError::new("Explain plan returned no results".to_string()))
     }
 }
 

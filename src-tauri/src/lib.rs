@@ -4,7 +4,7 @@ mod state;
 
 use driver_api::{
     ConnectionConfig, KeyValue, ScanResult, SchemaGraph, SchemaInfo, ServerInfo, TableInfo,
-    TableSchema, DatabaseError,
+    TableSchema, DatabaseError, PlanNode,
 };
 use state::AppState;
 use std::fs::File;
@@ -202,6 +202,16 @@ async fn refresh_metadata_cache(
 }
 
 #[tauri::command]
+async fn get_execution_plan(
+    state: State<'_, AppState>,
+    connection_id: String,
+    sql: String,
+) -> Result<PlanNode, DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    driver.get_execution_plan(&sql).await
+}
+
+#[tauri::command]
 async fn test_connection(
     state: State<'_, AppState>,
     driver_id: String,
@@ -386,6 +396,7 @@ pub fn run() {
             execute_query,
             cancel_query,
             refresh_metadata_cache,
+            get_execution_plan,
             test_connection,
             save_connection_profile,
             load_connection_profiles,

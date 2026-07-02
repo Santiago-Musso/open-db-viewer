@@ -145,6 +145,33 @@ pub trait RelationalDriver: Send + Sync {
     async fn refresh_table(&self, _schema: &str, _table: &str) -> Result<(), DatabaseError> {
         Ok(())
     }
+    async fn get_execution_plan(&self, _sql: &str) -> Result<PlanNode, DatabaseError> {
+        Err(DatabaseError::new("Explain plan is not supported by this driver".to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanNode {
+    #[serde(rename = "Node Type")]
+    pub node_type: String,
+    #[serde(rename = "Relation Name")]
+    pub relation_name: Option<String>,
+    #[serde(rename = "Alias")]
+    pub alias: Option<String>,
+    #[serde(rename = "Startup Cost")]
+    pub startup_cost: f64,
+    #[serde(rename = "Total Cost")]
+    pub total_cost: f64,
+    #[serde(rename = "Plan Rows")]
+    pub plan_rows: f64,
+    #[serde(rename = "Plan Width")]
+    pub plan_width: u64,
+    #[serde(rename = "Actual Rows")]
+    pub actual_rows: Option<f64>,
+    #[serde(rename = "Actual Loops")]
+    pub actual_loops: Option<u64>,
+    #[serde(rename = "Plans")]
+    pub plans: Option<Vec<PlanNode>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
