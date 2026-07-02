@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DriverKind {
@@ -79,6 +80,40 @@ pub struct SchemaGraph {
 }
 
 #[async_trait]
+pub trait DataSource: Send + Sync {
+    async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, String>;
+    async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, String>;
+    async fn get_server_version(&self) -> Result<String, String>;
+}
+
+#[async_trait]
+pub trait ExecutionContext: Send + Sync {
+    async fn get_active_schema(&self) -> Result<String, String>;
+    async fn set_active_schema(&self, schema: &str) -> Result<(), String>;
+    async fn get_search_path(&self) -> Result<Vec<String>, String>;
+    async fn open_session(&self, purpose: &str) -> Result<Box<dyn DbSession>, String>;
+}
+
+#[async_trait]
+pub trait DbSession: Send + Sync {
+    async fn prepare_statement(&self, sql: &str) -> Result<Box<dyn DbStatement>, String>;
+}
+
+#[async_trait]
+pub trait DbStatement: Send + Sync {
+    async fn execute_query(&self) -> Result<Box<dyn DbResultSet>, String>;
+    async fn execute_update(&self) -> Result<u64, String>;
+    fn set_fetch_size(&mut self, size: usize);
+    fn set_query_timeout(&mut self, seconds: u32);
+}
+
+#[async_trait]
+pub trait DbResultSet: Send + Sync {
+    fn get_metadata(&self) -> Result<Vec<ColumnInfo>, String>;
+    async fn next_row_batch(&mut self, batch_size: usize) -> Result<Option<RowBatch>, String>;
+}
+
+#[async_trait]
 pub trait RelationalDriver: Send + Sync {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, String>;
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, String>;
@@ -127,3 +162,4 @@ pub trait KeyValueDriver: Send + Sync {
     async fn delete_key(&self, key: &str) -> Result<(), String>;
     async fn server_info(&self) -> Result<ServerInfo, String>;
 }
+

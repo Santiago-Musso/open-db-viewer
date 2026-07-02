@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use driver_api::{
-    ColumnInfo, ConnectionConfig, RelationalDriver, RowBatch, SchemaEdge, SchemaGraph, SchemaInfo,
-    SchemaNode, TableInfo, TableSchema,
+    ColumnInfo, ConnectionConfig, DataSource, DbResultSet, DbSession, DbStatement,
+    ExecutionContext, RelationalDriver, RowBatch, SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode,
+    TableInfo, TableSchema,
 };
 use futures_util::Stream;
 use futures_util::StreamExt;
@@ -13,6 +14,7 @@ use tokio_postgres::{Client, NoTls};
 
 pub struct PostgresDriver {
     client: Arc<Client>,
+    context: Arc<PostgresExecutionContext>,
     _connection_task: tokio::task::JoinHandle<()>,
     cancel_tokens: Arc<Mutex<HashMap<String, tokio_postgres::CancelToken>>>,
 }
@@ -46,11 +48,196 @@ impl PostgresDriver {
             }
         });
 
+        let client_arc = Arc::new(client);
+        let context = Arc::new(PostgresExecutionContext::new(client_arc.clone()).await?);
+
         Ok(Self {
-            client: Arc::new(client),
+            client: client_arc,
+            context,
             _connection_task: connection_task,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+}
+
+pub struct PostgresExecutionContext {
+    client: Arc<Client>,
+    active_schema: tokio::sync::Mutex<String>,
+}
+
+impl PostgresExecutionContext {
+    pub async fn new(client: Arc<Client>) -> Result<Self, String> {
+        let rows = client
+            .query("SELECT current_schema()", &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        let active_schema = if let Some(row) = rows.first() {
+            row.get::<_, Option<String>>(0)
+                .unwrap_or_else(|| "public".to_string())
+        } else {
+            "public".to_string()
+        };
+        Ok(Self {
+            client,
+            active_schema: tokio::sync::Mutex::new(active_schema),
+        })
+    }
+}
+
+#[async_trait]
+impl ExecutionContext for PostgresExecutionContext {
+    async fn get_active_schema(&self) -> Result<String, String> {
+        let schema = self.active_schema.lock().await;
+        Ok(schema.clone())
+    }
+
+    async fn set_active_schema(&self, schema: &str) -> Result<(), String> {
+        let escaped = schema.replace("\"", "\"\"");
+        self.client
+            .execute(&format!("SET search_path TO \"{}\"", escaped), &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut active = self.active_schema.lock().await;
+        *active = schema.to_string();
+        Ok(())
+    }
+
+    async fn get_search_path(&self) -> Result<Vec<String>, String> {
+        let rows = self
+            .client
+            .query("SHOW search_path", &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(row) = rows.first() {
+            let path_str: String = row.get(0);
+            let paths = path_str
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect();
+            Ok(paths)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn open_session(&self, _purpose: &str) -> Result<Box<dyn DbSession>, String> {
+        Ok(Box::new(PostgresSession {
+            client: self.client.clone(),
+        }))
+    }
+}
+
+pub struct PostgresSession {
+    client: Arc<Client>,
+}
+
+#[async_trait]
+impl DbSession for PostgresSession {
+    async fn prepare_statement(&self, sql: &str) -> Result<Box<dyn DbStatement>, String> {
+        let stmt = self.client.prepare(sql).await.map_err(|e| e.to_string())?;
+        Ok(Box::new(PostgresStatement {
+            client: self.client.clone(),
+            stmt,
+            _fetch_size: 100,
+            _timeout_seconds: None,
+        }))
+    }
+}
+
+pub struct PostgresStatement {
+    client: Arc<Client>,
+    stmt: tokio_postgres::Statement,
+    _fetch_size: usize,
+    _timeout_seconds: Option<u32>,
+}
+
+#[async_trait]
+impl DbStatement for PostgresStatement {
+    async fn execute_query(&self) -> Result<Box<dyn DbResultSet>, String> {
+        let row_stream = self
+            .client
+            .query_raw(&self.stmt, std::iter::empty::<Option<i32>>())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let columns = self
+            .stmt
+            .columns()
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name().to_string(),
+                data_type: c.type_().name().to_string(),
+            })
+            .collect();
+
+        Ok(Box::new(PostgresResultSet {
+            columns,
+            stream: tokio::sync::Mutex::new(Box::pin(row_stream)),
+        }))
+    }
+
+    async fn execute_update(&self) -> Result<u64, String> {
+        let rows_affected = self
+            .client
+            .execute(&self.stmt, &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(rows_affected)
+    }
+
+    fn set_fetch_size(&mut self, size: usize) {
+        self._fetch_size = size;
+    }
+
+    fn set_query_timeout(&mut self, seconds: u32) {
+        self._timeout_seconds = Some(seconds);
+    }
+}
+
+pub struct PostgresResultSet {
+    columns: Vec<ColumnInfo>,
+    stream: tokio::sync::Mutex<
+        Pin<
+            Box<
+                dyn Stream<Item = Result<tokio_postgres::Row, tokio_postgres::Error>>
+                    + Send,
+            >,
+        >,
+    >,
+}
+
+#[async_trait]
+impl DbResultSet for PostgresResultSet {
+    fn get_metadata(&self) -> Result<Vec<ColumnInfo>, String> {
+        Ok(self.columns.clone())
+    }
+
+    async fn next_row_batch(&mut self, batch_size: usize) -> Result<Option<RowBatch>, String> {
+        let mut stream = self.stream.lock().await;
+        let mut rows = Vec::new();
+
+        for _ in 0..batch_size {
+            match stream.next().await {
+                Some(Ok(row)) => {
+                    let mut row_values = Vec::new();
+                    for i in 0..row.len() {
+                        row_values.push(pg_value_to_json(&row, i));
+                    }
+                    rows.push(row_values);
+                }
+                Some(Err(e)) => return Err(e.to_string()),
+                None => break,
+            }
+        }
+
+        if rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(RowBatch {
+                columns: self.columns.clone(),
+                rows,
+            }))
+        }
     }
 }
 
@@ -183,65 +370,119 @@ fn pg_value_to_json(row: &tokio_postgres::Row, index: usize) -> serde_json::Valu
 }
 
 #[async_trait]
-impl RelationalDriver for PostgresDriver {
-    async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, String> {
+impl DataSource for PostgresDriver {
+    async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, String> {
+        Ok(self.context.clone())
+    }
+
+    async fn open_context(&self, _purpose: &str) -> Result<Arc<dyn ExecutionContext>, String> {
+        let ctx = PostgresExecutionContext::new(self.client.clone()).await?;
+        Ok(Arc::new(ctx))
+    }
+
+    async fn get_server_version(&self) -> Result<String, String> {
         let rows = self
             .client
-            .query(
+            .query("SELECT version()", &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(row) = rows.first() {
+            let version: String = row.get(0);
+            Ok(version)
+        } else {
+            Err("Failed to query version".to_string())
+        }
+    }
+}
+
+#[async_trait]
+impl RelationalDriver for PostgresDriver {
+    async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, String> {
+        let ctx = self.get_default_context().await?;
+        let session = ctx.open_session("metadata").await?;
+        let stmt = session
+            .prepare_statement(
                 "SELECT schema_name FROM information_schema.schemata \
                  WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
                  ORDER BY schema_name",
-                &[],
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
+        let mut rs = stmt.execute_query().await?;
 
         let mut schemas = Vec::new();
-        for row in rows {
-            let name: String = row.get(0);
-            schemas.push(SchemaInfo { name });
+        while let Some(batch) = rs.next_row_batch(100).await? {
+            for row in batch.rows {
+                if let Some(serde_json::Value::String(name)) = row.first() {
+                    schemas.push(SchemaInfo { name: name.clone() });
+                }
+            }
         }
         Ok(schemas)
     }
 
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, String> {
-        let rows = self
-            .client
-            .query(
-                "SELECT table_schema, table_name FROM information_schema.tables \
-                 WHERE table_schema = $1 AND table_type = 'BASE TABLE' \
-                 ORDER BY table_name",
-                &[&schema],
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let ctx = self.get_default_context().await?;
+        let session = ctx.open_session("metadata").await?;
+        let escaped_schema = schema.replace("'", "''");
+        let sql = format!(
+            "SELECT table_schema, table_name FROM information_schema.tables \
+             WHERE table_schema = '{}' AND table_type = 'BASE TABLE' \
+             ORDER BY table_name",
+            escaped_schema
+        );
+        let stmt = session.prepare_statement(&sql).await?;
+        let mut rs = stmt.execute_query().await?;
 
         let mut tables = Vec::new();
-        for row in rows {
-            let schema: String = row.get(0);
-            let name: String = row.get(1);
-            tables.push(TableInfo { schema, name });
+        while let Some(batch) = rs.next_row_batch(100).await? {
+            for row in batch.rows {
+                if row.len() >= 2 {
+                    if let (
+                        serde_json::Value::String(schema_val),
+                        serde_json::Value::String(name_val),
+                    ) = (&row[0], &row[1])
+                    {
+                        tables.push(TableInfo {
+                            schema: schema_val.clone(),
+                            name: name_val.clone(),
+                        });
+                    }
+                }
+            }
         }
         Ok(tables)
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, String> {
-        let rows = self
-            .client
-            .query(
-                "SELECT column_name, data_type FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 \
-                 ORDER BY ordinal_position",
-                &[&schema, &table],
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let ctx = self.get_default_context().await?;
+        let session = ctx.open_session("metadata").await?;
+        let escaped_schema = schema.replace("'", "''");
+        let escaped_table = table.replace("'", "''");
+        let sql = format!(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_schema = '{}' AND table_name = '{}' \
+             ORDER BY ordinal_position",
+            escaped_schema, escaped_table
+        );
+        let stmt = session.prepare_statement(&sql).await?;
+        let mut rs = stmt.execute_query().await?;
 
         let mut columns = Vec::new();
-        for row in rows {
-            let name: String = row.get(0);
-            let data_type: String = row.get(1);
-            columns.push(ColumnInfo { name, data_type });
+        while let Some(batch) = rs.next_row_batch(100).await? {
+            for row in batch.rows {
+                if row.len() >= 2 {
+                    if let (
+                        serde_json::Value::String(name_val),
+                        serde_json::Value::String(data_type_val),
+                    ) = (&row[0], &row[1])
+                    {
+                        columns.push(ColumnInfo {
+                            name: name_val.clone(),
+                            data_type: data_type_val.clone(),
+                        });
+                    }
+                }
+            }
         }
         Ok(TableSchema { columns })
     }
@@ -260,37 +501,46 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, String> {
-        // Single query via pg_catalog to fetch ALL tables and columns (avoids information_schema privilege issues)
-        let col_rows = self
-            .client
-            .query(
-                "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type \
-                 FROM pg_class c \
-                 JOIN pg_namespace n ON c.relnamespace = n.oid \
-                 JOIN pg_attribute a ON a.attrelid = c.oid \
-                 JOIN pg_type t ON a.atttypid = t.oid \
-                 WHERE n.nspname = $1 \
-                   AND c.relkind = 'r' \
-                   AND a.attnum > 0 \
-                   AND NOT a.attisdropped \
-                 ORDER BY c.relname, a.attnum",
-                &[&schema],
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let ctx = self.get_default_context().await?;
+        let session = ctx.open_session("metadata").await?;
+        let escaped_schema = schema.replace("'", "''");
+
+        let col_sql = format!(
+            "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type \
+             FROM pg_class c \
+             JOIN pg_namespace n ON c.relnamespace = n.oid \
+             JOIN pg_attribute a ON a.attrelid = c.oid \
+             JOIN pg_type t ON a.atttypid = t.oid \
+             WHERE n.nspname = '{}' \
+               AND c.relkind = 'r' \
+               AND a.attnum > 0 \
+               AND NOT a.attisdropped \
+             ORDER BY c.relname, a.attnum",
+            escaped_schema
+        );
+        let col_stmt = session.prepare_statement(&col_sql).await?;
+        let mut col_rs = col_stmt.execute_query().await?;
 
         let mut table_map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
-        for row in col_rows {
-            let table_name: String = row.get(0);
-            let col_name: String = row.get(1);
-            let data_type: String = row.get(2);
-            table_map
-                .entry(table_name)
-                .or_default()
-                .push(ColumnInfo {
-                    name: col_name,
-                    data_type,
-                });
+        while let Some(batch) = col_rs.next_row_batch(100).await? {
+            for row in batch.rows {
+                if row.len() >= 3 {
+                    if let (
+                        serde_json::Value::String(table_name),
+                        serde_json::Value::String(col_name),
+                        serde_json::Value::String(data_type),
+                    ) = (&row[0], &row[1], &row[2])
+                    {
+                        table_map
+                            .entry(table_name.clone())
+                            .or_default()
+                            .push(ColumnInfo {
+                                name: col_name.clone(),
+                                data_type: data_type.clone(),
+                            });
+                    }
+                }
+            }
         }
 
         let nodes: Vec<SchemaNode> = table_map
@@ -302,37 +552,47 @@ impl RelationalDriver for PostgresDriver {
             })
             .collect();
 
-        // Single query for all foreign key constraints via pg_catalog
-        let fk_rows = self
-            .client
-            .query(
-                "SELECT \
-                    c.conname, \
-                    cl1.relname, \
-                    a1.attname, \
-                    cl2.relname, \
-                    a2.attname \
-                 FROM pg_constraint c \
-                 JOIN pg_class cl1 ON c.conrelid = cl1.oid \
-                 JOIN pg_class cl2 ON c.confrelid = cl2.oid \
-                 JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid \
-                 JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid \
-                 JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid \
-                 WHERE c.contype = 'f' AND n1.nspname = $1",
-                &[&schema],
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let fk_sql = format!(
+            "SELECT \
+                c.conname, \
+                cl1.relname, \
+                a1.attname, \
+                cl2.relname, \
+                a2.attname \
+             FROM pg_constraint c \
+             JOIN pg_class cl1 ON c.conrelid = cl1.oid \
+             JOIN pg_class cl2 ON c.confrelid = cl2.oid \
+             JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid \
+             JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid \
+             JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid \
+             WHERE c.contype = 'f' AND n1.nspname = '{}'",
+            escaped_schema
+        );
+        let fk_stmt = session.prepare_statement(&fk_sql).await?;
+        let mut fk_rs = fk_stmt.execute_query().await?;
 
         let mut edges = Vec::new();
-        for row in fk_rows {
-            edges.push(SchemaEdge {
-                id: row.get(0),
-                source: row.get(1),
-                source_handle: row.get(2),
-                target: row.get(3),
-                target_handle: row.get(4),
-            });
+        while let Some(batch) = fk_rs.next_row_batch(100).await? {
+            for row in batch.rows {
+                if row.len() >= 5 {
+                    if let (
+                        serde_json::Value::String(conname),
+                        serde_json::Value::String(table1),
+                        serde_json::Value::String(col1),
+                        serde_json::Value::String(table2),
+                        serde_json::Value::String(col2),
+                    ) = (&row[0], &row[1], &row[2], &row[3], &row[4])
+                    {
+                        edges.push(SchemaEdge {
+                            id: conname.clone(),
+                            source: table1.clone(),
+                            source_handle: col1.clone(),
+                            target: table2.clone(),
+                            target_handle: col2.clone(),
+                        });
+                    }
+                }
+            }
         }
 
         Ok(SchemaGraph { nodes, edges })
@@ -355,78 +615,49 @@ impl RelationalDriver for PostgresDriver {
         if let Some(off) = offset {
             let lower = sql.trim().to_lowercase();
             if lower.starts_with("select") || lower.starts_with("with") {
-                final_sql = format!("SELECT * FROM ({}) AS _odv_wrapper LIMIT {} OFFSET {}", sql, batch_size, off);
+                final_sql = format!(
+                    "SELECT * FROM ({}) AS _odv_wrapper LIMIT {} OFFSET {}",
+                    sql, batch_size, off
+                );
             }
         }
 
-        let stmt = self.client.prepare(&final_sql).await.map_err(|e| e.to_string())?;
-        let columns: Vec<ColumnInfo> = stmt
-            .columns()
-            .iter()
-            .map(|c| ColumnInfo {
-                name: c.name().to_string(),
-                data_type: c.type_().name().to_string(),
-            })
-            .collect();
+        let ctx = self.get_default_context().await?;
+        let session = ctx.open_session("query").await?;
+        let mut stmt = session.prepare_statement(&final_sql).await?;
+        stmt.set_fetch_size(batch_size);
 
-        let row_stream = self
-            .client
-            .query_raw(&stmt, std::iter::empty::<Option<i32>>())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let columns_clone = columns.clone();
-        let mapped_stream = row_stream.map(move |row_res| match row_res {
-            Ok(row) => {
-                let mut row_values = Vec::new();
-                for i in 0..row.len() {
-                    let val = pg_value_to_json(&row, i);
-                    row_values.push(val);
-                }
-                Ok(row_values)
-            }
-            Err(e) => Err(e.to_string()),
-        });
+        let rs = stmt.execute_query().await?;
 
         let cancel_tokens_clone = self.cancel_tokens.clone();
         let query_id_clone = query_id.to_string();
 
-        let batched_stream = mapped_stream
-            .chunks(batch_size)
-            .map(move |chunk| {
-                let mut rows = Vec::new();
-                for row_res in chunk {
-                    match row_res {
-                        Ok(row) => rows.push(row),
-                        Err(e) => return Err(e),
+        let stream = futures_util::stream::unfold(
+            (rs, cancel_tokens_clone, query_id_clone, false),
+            move |(mut rs, cancel_tokens, query_id, finished)| async move {
+                if finished {
+                    return None;
+                }
+                match rs.next_row_batch(batch_size).await {
+                    Ok(Some(batch)) => Some((Ok(batch), (rs, cancel_tokens, query_id, false))),
+                    Ok(None) => {
+                        cancel_tokens.lock().await.remove(&query_id);
+                        None
+                    }
+                    Err(e) => {
+                        cancel_tokens.lock().await.remove(&query_id);
+                        Some((Err(e), (rs, cancel_tokens, query_id, true)))
                     }
                 }
-                Ok(RowBatch {
-                    columns: columns_clone.clone(),
-                    rows,
-                })
-            })
-            // Remove the cancel token when the stream completes/ends
-            .then(move |batch_res| {
-                let cancel_tokens = cancel_tokens_clone.clone();
-                let query_id = query_id_clone.clone();
-                async move {
-                    // Check if it's the end of stream (handled automatically when dropped, but let's clear here as well)
-                    // If we want to clean it up, we can do it inside this map block
-                    cancel_tokens.lock().await.remove(&query_id);
-                    batch_res
-                }
-            });
+            },
+        );
 
-        Ok(Box::pin(batched_stream))
+        Ok(Box::pin(stream))
     }
 
     async fn cancel_query(&self, query_id: &str) -> Result<(), String> {
         let token_opt = self.cancel_tokens.lock().await.remove(query_id);
         if let Some(token) = token_opt {
-            // Execute the cancellation out of band (non-blocking)
-            // Wait, we need an active connection to cancel. tokio-postgres cancel_query() makes a new connection to request cancel
-            // It is an async operation that requires NoTls or similar
             tokio::spawn(async move {
                 let _ = token.cancel_query(NoTls).await;
             });
@@ -454,3 +685,4 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
