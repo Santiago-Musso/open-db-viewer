@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use driver_api::{
     ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
-    SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema,
+    SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema, SqlDialect,
 };
 use futures_util::Stream;
 use std::collections::HashMap;
@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
 
 pub mod connection;
+pub mod dialect;
 pub mod types;
 
 use connection::PostgresExecutionContext;
@@ -19,6 +20,7 @@ pub struct PostgresDriver {
     main_context: Arc<PostgresExecutionContext>,
     metadata_context: Arc<PostgresExecutionContext>,
     utility_context: Arc<PostgresExecutionContext>,
+    dialect: Arc<dialect::PostgreDialect>,
     _connection_tasks: Vec<tokio::task::JoinHandle<()>>,
     cancel_tokens: Arc<Mutex<HashMap<String, tokio_postgres::CancelToken>>>,
 }
@@ -73,11 +75,13 @@ impl PostgresDriver {
         let main_context = Arc::new(PostgresExecutionContext::new(main_arc).await?);
         let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc).await?);
         let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc).await?);
+        let dialect = Arc::new(dialect::PostgreDialect);
 
         Ok(Self {
             main_context,
             metadata_context,
             utility_context,
+            dialect,
             _connection_tasks: vec![main_task, metadata_task, utility_task],
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -96,6 +100,10 @@ impl DataSource for PostgresDriver {
             "plan" | "utility" | "cancel" => Ok(self.utility_context.clone()),
             _ => Ok(self.main_context.clone()),
         }
+    }
+
+    fn get_dialect(&self) -> Arc<dyn SqlDialect> {
+        self.dialect.clone()
     }
 
     async fn get_server_version(&self) -> Result<String, String> {
@@ -330,16 +338,7 @@ impl RelationalDriver for PostgresDriver {
             .await
             .insert(query_id.to_string(), cancel_token);
 
-        let mut final_sql = sql.to_string();
-        if let Some(off) = offset {
-            let lower = sql.trim().to_lowercase();
-            if lower.starts_with("select") || lower.starts_with("with") {
-                final_sql = format!(
-                    "SELECT * FROM ({}) AS _odv_wrapper LIMIT {} OFFSET {}",
-                    sql, batch_size, off
-                );
-            }
-        }
+        let final_sql = self.get_dialect().transform_query_limit(sql, batch_size, offset);
 
         let ctx = self.open_context("query").await?;
         let session = ctx.open_session("query").await?;

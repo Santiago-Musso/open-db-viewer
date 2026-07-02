@@ -1,10 +1,13 @@
 use async_trait::async_trait;
-use driver_api::{ColumnInfo, DbResultSet, DbSession, DbStatement, ExecutionContext, RowBatch};
+use driver_api::{
+    ColumnInfo, DbResultSet, DbSession, DbStatement, ExecutionContext, RowBatch, SqlDialect,
+};
 use futures_util::Stream;
 use futures_util::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_postgres::Client;
+use crate::dialect::PostgreDialect;
 
 pub struct PostgresExecutionContext {
     client: Arc<Client>,
@@ -42,9 +45,9 @@ impl ExecutionContext for PostgresExecutionContext {
     }
 
     async fn set_active_schema(&self, schema: &str) -> Result<(), String> {
-        let escaped = schema.replace("\"", "\"\"");
+        let quoted = PostgreDialect.quote_identifier(schema);
         self.client
-            .execute(&format!("SET search_path TO \"{}\"", escaped), &[])
+            .execute(&format!("SET search_path TO {}", quoted), &[])
             .await
             .map_err(|e| e.to_string())?;
         let mut active = self.active_schema.lock().await;

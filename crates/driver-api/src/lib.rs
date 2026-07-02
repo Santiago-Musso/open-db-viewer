@@ -79,11 +79,19 @@ pub struct SchemaGraph {
     pub edges: Vec<SchemaEdge>,
 }
 
+pub trait SqlDialect: Send + Sync {
+    fn quote_identifier(&self, ident: &str) -> String;
+    fn escape_string_literal(&self, val: &str) -> String;
+    fn get_type_cast_clause(&self, column_type: &str) -> Option<String>;
+    fn transform_query_limit(&self, sql: &str, limit: usize, offset: Option<usize>) -> String;
+}
+
 #[async_trait]
 pub trait DataSource: Send + Sync {
     async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, String>;
     async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, String>;
     async fn get_server_version(&self) -> Result<String, String>;
+    fn get_dialect(&self) -> Arc<dyn SqlDialect>;
 }
 
 #[async_trait]
