@@ -4,7 +4,7 @@ mod state;
 
 use driver_api::{
     ConnectionConfig, KeyValue, ScanResult, SchemaGraph, SchemaInfo, ServerInfo, TableInfo,
-    TableSchema, DatabaseError, PlanNode,
+    TableSchema, DatabaseError, PlanNode, DbSessionInfo,
 };
 use state::AppState;
 use std::fs::File;
@@ -212,6 +212,35 @@ async fn get_execution_plan(
 }
 
 #[tauri::command]
+async fn list_active_sessions(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    driver.list_active_sessions().await
+}
+
+#[tauri::command]
+async fn cancel_session(
+    state: State<'_, AppState>,
+    connection_id: String,
+    pid: i32,
+) -> Result<(), DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    driver.cancel_session(pid).await
+}
+
+#[tauri::command]
+async fn terminate_session(
+    state: State<'_, AppState>,
+    connection_id: String,
+    pid: i32,
+) -> Result<(), DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    driver.terminate_session(pid).await
+}
+
+#[tauri::command]
 async fn test_connection(
     state: State<'_, AppState>,
     driver_id: String,
@@ -397,6 +426,9 @@ pub fn run() {
             cancel_query,
             refresh_metadata_cache,
             get_execution_plan,
+            list_active_sessions,
+            cancel_session,
+            terminate_session,
             test_connection,
             save_connection_profile,
             load_connection_profiles,

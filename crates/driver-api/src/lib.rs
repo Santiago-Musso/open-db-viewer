@@ -148,6 +148,15 @@ pub trait RelationalDriver: Send + Sync {
     async fn get_execution_plan(&self, _sql: &str) -> Result<PlanNode, DatabaseError> {
         Err(DatabaseError::new("Explain plan is not supported by this driver".to_string()))
     }
+    async fn list_active_sessions(&self) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+        Err(DatabaseError::new("Session management is not supported by this driver".to_string()))
+    }
+    async fn cancel_session(&self, _pid: i32) -> Result<(), DatabaseError> {
+        Err(DatabaseError::new("Session cancel is not supported by this driver".to_string()))
+    }
+    async fn terminate_session(&self, _pid: i32) -> Result<(), DatabaseError> {
+        Err(DatabaseError::new("Session termination is not supported by this driver".to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +181,16 @@ pub struct PlanNode {
     pub actual_loops: Option<u64>,
     #[serde(rename = "Plans")]
     pub plans: Option<Vec<PlanNode>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbSessionInfo {
+    pub pid: i32,
+    pub username: Option<String>,
+    pub query: Option<String>,
+    pub state: Option<String>,
+    pub query_start: Option<String>,
+    pub client_addr: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

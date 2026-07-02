@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use driver_api::{
     ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
     SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema, SqlDialect,
-    DatabaseError, PlanNode,
+    DatabaseError, PlanNode, DbSessionInfo,
 };
 use futures_util::Stream;
 use std::collections::HashMap;
@@ -492,6 +492,83 @@ impl RelationalDriver for PostgresDriver {
             }
         }
         Err(DatabaseError::new("Explain plan returned no results".to_string()))
+    }
+
+    async fn list_active_sessions(&self) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+        let ctx = self.open_context("utility").await?;
+        let session = ctx.open_session("utility").await?;
+        let stmt = session
+            .prepare_statement(
+                "SELECT \
+                    pid, \
+                    usename::text, \
+                    query::text, \
+                    state::text, \
+                    query_start::text, \
+                    client_addr::text \
+                 FROM pg_catalog.pg_stat_activity \
+                 WHERE backend_type = 'client backend'",
+            )
+            .await?;
+        let mut rs = stmt.execute_query().await?;
+        let mut sessions = Vec::new();
+        while let Some(batch) = rs.next_row_batch(100).await? {
+            for row in batch.rows {
+                if row.len() >= 6 {
+                    let pid = match &row[0] {
+                        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
+                        _ => 0,
+                    };
+                    let username = match &row[1] {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    let query = match &row[2] {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    let state = match &row[3] {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    let query_start = match &row[4] {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    let client_addr = match &row[5] {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    sessions.push(DbSessionInfo {
+                        pid,
+                        username,
+                        query,
+                        state,
+                        query_start,
+                        client_addr,
+                    });
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    async fn cancel_session(&self, pid: i32) -> Result<(), DatabaseError> {
+        let ctx = self.open_context("utility").await?;
+        let session = ctx.open_session("utility").await?;
+        let sql = format!("SELECT pg_catalog.pg_cancel_backend({})", pid);
+        let stmt = session.prepare_statement(&sql).await?;
+        let _ = stmt.execute_update().await?;
+        Ok(())
+    }
+
+    async fn terminate_session(&self, pid: i32) -> Result<(), DatabaseError> {
+        let ctx = self.open_context("utility").await?;
+        let session = ctx.open_session("utility").await?;
+        let sql = format!("SELECT pg_catalog.pg_terminate_backend({})", pid);
+        let stmt = session.prepare_statement(&sql).await?;
+        let _ = stmt.execute_update().await?;
+        Ok(())
     }
 }
 
