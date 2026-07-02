@@ -3,6 +3,8 @@ use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use driver_api::DatabaseError;
+
 pub struct ObjectLookupCache<K, V> {
     pub cache: RwLock<HashMap<K, Arc<V>>>,
 }
@@ -17,10 +19,10 @@ where
         }
     }
 
-    pub async fn get_or_load<F, Fut>(&self, key: K, loader: F) -> Result<Arc<V>, String>
+    pub async fn get_or_load<F, Fut>(&self, key: K, loader: F) -> Result<Arc<V>, DatabaseError>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<V, String>>,
+        Fut: std::future::Future<Output = Result<V, DatabaseError>>,
     {
         // 1. Try to read with a read lock
         {

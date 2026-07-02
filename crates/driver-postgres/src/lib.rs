@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use driver_api::{
     ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
     SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema, SqlDialect,
+    DatabaseError,
 };
 use futures_util::Stream;
 use std::collections::HashMap;
@@ -105,9 +106,9 @@ impl PostgresDriver {
         }
         let type_registry_arc = Arc::new(type_registry);
 
-        let main_context = Arc::new(PostgresExecutionContext::new(main_arc, type_registry_arc.clone()).await?);
-        let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc, type_registry_arc.clone()).await?);
-        let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc, type_registry_arc.clone()).await?);
+        let main_context = Arc::new(PostgresExecutionContext::new(main_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
+        let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
+        let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
         let dialect = Arc::new(dialect::PostgreDialect);
 
         let schema_cache = metadata::ObjectLookupCache::new();
@@ -133,11 +134,11 @@ impl PostgresDriver {
 
 #[async_trait]
 impl DataSource for PostgresDriver {
-    async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, String> {
+    async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, DatabaseError> {
         Ok(self.main_context.clone())
     }
 
-    async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, String> {
+    async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, DatabaseError> {
         match purpose {
             "metadata" => Ok(self.metadata_context.clone()),
             "plan" | "utility" | "cancel" => Ok(self.utility_context.clone()),
@@ -149,7 +150,7 @@ impl DataSource for PostgresDriver {
         self.dialect.clone()
     }
 
-    async fn get_server_version(&self) -> Result<String, String> {
+    async fn get_server_version(&self) -> Result<String, DatabaseError> {
         let ctx = self.open_context("utility").await?;
         let session = ctx.open_session("utility").await?;
         let stmt = session.prepare_statement("SELECT version()").await?;
@@ -161,13 +162,13 @@ impl DataSource for PostgresDriver {
                 }
             }
         }
-        Err("Failed to query version".to_string())
+        Err(DatabaseError::new("Failed to query version".to_string()))
     }
 }
 
 #[async_trait]
 impl RelationalDriver for PostgresDriver {
-    async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, String> {
+    async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, DatabaseError> {
         let val = self.schema_cache.get_or_load((), || async {
             let ctx = self.open_context("metadata").await?;
             let session = ctx.open_session("metadata").await?;
@@ -193,7 +194,7 @@ impl RelationalDriver for PostgresDriver {
         Ok((*val).clone())
     }
 
-    async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, String> {
+    async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, DatabaseError> {
         let schema_owned = schema.to_string();
         let loader_schema = schema_owned.clone();
         let val = self.table_cache.get_or_load(schema_owned, || async move {
@@ -231,7 +232,7 @@ impl RelationalDriver for PostgresDriver {
         Ok((*val).clone())
     }
 
-    async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, String> {
+    async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, DatabaseError> {
         let key = (schema.to_string(), table.to_string());
         let loader_key = key.clone();
         let val = self.column_cache.get_or_load(key, || async move {
@@ -270,7 +271,7 @@ impl RelationalDriver for PostgresDriver {
         Ok((*val).clone())
     }
 
-    async fn get_table_ddl(&self, schema: &str, table: &str) -> Result<String, String> {
+    async fn get_table_ddl(&self, schema: &str, table: &str) -> Result<String, DatabaseError> {
         let cols = self.describe_table(schema, table).await?;
         let mut ddl = format!("CREATE TABLE {}.{} (\n", schema, table);
         let col_definitions: Vec<String> = cols
@@ -283,7 +284,7 @@ impl RelationalDriver for PostgresDriver {
         Ok(ddl)
     }
 
-    async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, String> {
+    async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, DatabaseError> {
         let schema_owned = schema.to_string();
         let loader_schema = schema_owned.clone();
         let val = self.graph_cache.get_or_load(schema_owned, || async move {
@@ -392,7 +393,7 @@ impl RelationalDriver for PostgresDriver {
         sql: &str,
         batch_size: usize,
         offset: Option<usize>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, String>> + Send>>, String> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, DatabaseError>> + Send>>, DatabaseError> {
         let cancel_token = self.main_context.cancel_token();
         self.cancel_tokens
             .lock()
@@ -434,7 +435,7 @@ impl RelationalDriver for PostgresDriver {
         Ok(Box::pin(stream))
     }
 
-    async fn cancel_query(&self, query_id: &str) -> Result<(), String> {
+    async fn cancel_query(&self, query_id: &str) -> Result<(), DatabaseError> {
         let token_opt = self.cancel_tokens.lock().await.remove(query_id);
         if let Some(token) = token_opt {
             tokio::spawn(async move {
@@ -444,7 +445,7 @@ impl RelationalDriver for PostgresDriver {
         Ok(())
     }
 
-    async fn refresh_schema(&self, schema: &str) -> Result<(), String> {
+    async fn refresh_schema(&self, schema: &str) -> Result<(), DatabaseError> {
         self.table_cache.invalidate(&schema.to_string()).await;
         self.graph_cache.invalidate(&schema.to_string()).await;
         let mut write = self.column_cache.cache.write().await;
@@ -452,7 +453,7 @@ impl RelationalDriver for PostgresDriver {
         Ok(())
     }
 
-    async fn refresh_table(&self, schema: &str, table: &str) -> Result<(), String> {
+    async fn refresh_table(&self, schema: &str, table: &str) -> Result<(), DatabaseError> {
         self.column_cache.invalidate(&(schema.to_string(), table.to_string())).await;
         self.graph_cache.invalidate(&schema.to_string()).await;
         Ok(())

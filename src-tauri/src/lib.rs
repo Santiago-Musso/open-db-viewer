@@ -4,7 +4,7 @@ mod state;
 
 use driver_api::{
     ConnectionConfig, KeyValue, ScanResult, SchemaGraph, SchemaInfo, ServerInfo, TableInfo,
-    TableSchema,
+    TableSchema, DatabaseError,
 };
 use state::AppState;
 use std::fs::File;
@@ -67,12 +67,12 @@ fn disconnect_db(state: State<'_, AppState>, connection_id: String) -> Result<()
 async fn list_schemas(
     state: State<'_, AppState>,
     connection_id: String,
-) -> Result<Vec<SchemaInfo>, String> {
+) -> Result<Vec<SchemaInfo>, DatabaseError> {
     println!(
         "DEBUG: list_schemas called for connection: {}",
         connection_id
     );
-    let driver = state.manager.get_relational(&connection_id)?;
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     let res = driver.list_schemas().await;
     println!("DEBUG: list_schemas result: {:?}", res);
     res
@@ -83,8 +83,8 @@ async fn list_tables(
     state: State<'_, AppState>,
     connection_id: String,
     schema: String,
-) -> Result<Vec<TableInfo>, String> {
-    let driver = state.manager.get_relational(&connection_id)?;
+) -> Result<Vec<TableInfo>, DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     driver.list_tables(&schema).await
 }
 
@@ -94,8 +94,8 @@ async fn describe_table(
     connection_id: String,
     schema: String,
     table: String,
-) -> Result<TableSchema, String> {
-    let driver = state.manager.get_relational(&connection_id)?;
+) -> Result<TableSchema, DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     driver.describe_table(&schema, &table).await
 }
 
@@ -105,8 +105,8 @@ async fn get_table_ddl(
     connection_id: String,
     schema: String,
     table: String,
-) -> Result<String, String> {
-    let driver = state.manager.get_relational(&connection_id)?;
+) -> Result<String, DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     driver.get_table_ddl(&schema, &table).await
 }
 
@@ -115,8 +115,8 @@ async fn get_schema_graph(
     state: State<'_, AppState>,
     connection_id: String,
     schema: String,
-) -> Result<SchemaGraph, String> {
-    let driver = state.manager.get_relational(&connection_id)?;
+) -> Result<SchemaGraph, DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     driver.get_schema_graph(&schema).await
 }
 
@@ -129,8 +129,8 @@ async fn execute_query(
     sql: String,
     batch_size: usize,
     offset: Option<usize>,
-) -> Result<(), String> {
-    let driver = state.manager.get_relational(&connection_id)?;
+) -> Result<(), DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     let mut stream = driver
         .execute_query_stream(&query_id, &sql, batch_size, offset)
         .await?;
@@ -178,9 +178,27 @@ async fn cancel_query(
     state: State<'_, AppState>,
     connection_id: String,
     query_id: String,
-) -> Result<(), String> {
-    let driver = state.manager.get_relational(&connection_id)?;
+) -> Result<(), DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
     driver.cancel_query(&query_id).await
+}
+
+#[tauri::command]
+async fn refresh_metadata_cache(
+    state: State<'_, AppState>,
+    connection_id: String,
+    schema: Option<String>,
+    table: Option<String>,
+) -> Result<(), DatabaseError> {
+    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    if let Some(tbl) = table {
+        if let Some(sch) = schema {
+            driver.refresh_table(&sch, &tbl).await?;
+        }
+    } else if let Some(sch) = schema {
+        driver.refresh_schema(&sch).await?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -367,6 +385,7 @@ pub fn run() {
             get_schema_graph,
             execute_query,
             cancel_query,
+            refresh_metadata_cache,
             test_connection,
             save_connection_profile,
             load_connection_profiles,
