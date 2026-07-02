@@ -260,34 +260,58 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, String> {
-        // Fetch all tables
-        let tables = self.list_tables(schema).await?;
-        let mut nodes = Vec::new();
-        for t in &tables {
-            let schema_info = self.describe_table(schema, &t.name).await?;
-            nodes.push(SchemaNode {
-                id: t.name.clone(),
-                label: t.name.clone(),
-                columns: schema_info.columns,
-            });
-        }
-
-        // Fetch all foreign key constraints using pg_catalog to avoid information_schema privilege bugs
-        let rows = self
+        // Single query to fetch ALL tables and their columns at once (no N+1)
+        let col_rows = self
             .client
             .query(
-                "SELECT 
-                    c.conname AS constraint_name, 
-                    cl1.relname AS source_table, 
-                    a1.attname AS source_column, 
-                    cl2.relname AS target_table, 
-                    a2.attname AS target_column 
-                 FROM pg_constraint c 
-                 JOIN pg_class cl1 ON c.conrelid = cl1.oid 
-                 JOIN pg_class cl2 ON c.confrelid = cl2.oid 
-                 JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid 
-                 JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid 
-                 JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid 
+                "SELECT table_name, column_name, data_type \
+                 FROM information_schema.columns \
+                 WHERE table_schema = $1 \
+                 ORDER BY table_name, ordinal_position",
+                &[&schema],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut table_map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
+        for row in col_rows {
+            let table_name: String = row.get(0);
+            let col_name: String = row.get(1);
+            let data_type: String = row.get(2);
+            table_map
+                .entry(table_name)
+                .or_default()
+                .push(ColumnInfo {
+                    name: col_name,
+                    data_type,
+                });
+        }
+
+        let nodes: Vec<SchemaNode> = table_map
+            .into_iter()
+            .map(|(name, columns)| SchemaNode {
+                id: name.clone(),
+                label: name,
+                columns,
+            })
+            .collect();
+
+        // Single query for all foreign key constraints via pg_catalog
+        let fk_rows = self
+            .client
+            .query(
+                "SELECT \
+                    c.conname, \
+                    cl1.relname, \
+                    a1.attname, \
+                    cl2.relname, \
+                    a2.attname \
+                 FROM pg_constraint c \
+                 JOIN pg_class cl1 ON c.conrelid = cl1.oid \
+                 JOIN pg_class cl2 ON c.confrelid = cl2.oid \
+                 JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid \
+                 JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid \
+                 JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid \
                  WHERE c.contype = 'f' AND n1.nspname = $1",
                 &[&schema],
             )
@@ -295,19 +319,13 @@ impl RelationalDriver for PostgresDriver {
             .map_err(|e| e.to_string())?;
 
         let mut edges = Vec::new();
-        for row in rows {
-            let constraint_name: String = row.get(0);
-            let source_table: String = row.get(1);
-            let source_column: String = row.get(2);
-            let target_table: String = row.get(3);
-            let target_column: String = row.get(4);
-
+        for row in fk_rows {
             edges.push(SchemaEdge {
-                id: constraint_name,
-                source: source_table.clone(),
-                target: target_table.clone(),
-                source_handle: source_column,
-                target_handle: target_column,
+                id: row.get(0),
+                source: row.get(1),
+                source_handle: row.get(2),
+                target: row.get(3),
+                target_handle: row.get(4),
             });
         }
 
