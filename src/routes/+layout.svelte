@@ -21,12 +21,10 @@
       }
     }
   }
-
-  $effect(() => {
-    document.body.style.zoom = zoomLevel.toString();
-  });
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
 
-{@render children()}
+<div style="zoom: {zoomLevel}; width: {100 / zoomLevel}vw; height: {100 / zoomLevel}vh; overflow: hidden; display: flex; flex-direction: column;">
+  {@render children()}
+</div>
