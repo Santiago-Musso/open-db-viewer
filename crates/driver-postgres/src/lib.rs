@@ -1,25 +1,42 @@
 use async_trait::async_trait;
 use driver_api::{
-    ColumnInfo, ConnectionConfig, DataSource, DbResultSet, DbSession, DbStatement,
-    ExecutionContext, RelationalDriver, RowBatch, SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode,
-    TableInfo, TableSchema,
+    ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
+    SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema,
 };
 use futures_util::Stream;
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::NoTls;
+
+pub mod connection;
+pub mod types;
+
+use connection::PostgresExecutionContext;
 
 pub struct PostgresDriver {
-    client: Arc<Client>,
-    context: Arc<PostgresExecutionContext>,
-    _connection_task: tokio::task::JoinHandle<()>,
+    main_context: Arc<PostgresExecutionContext>,
+    metadata_context: Arc<PostgresExecutionContext>,
+    utility_context: Arc<PostgresExecutionContext>,
+    _connection_tasks: Vec<tokio::task::JoinHandle<()>>,
     cancel_tokens: Arc<Mutex<HashMap<String, tokio_postgres::CancelToken>>>,
 }
 
 impl PostgresDriver {
+    async fn connect_single(conn_str: &str) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), String> {
+        let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let connection_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Postgres connection error: {}", e);
+            }
+        });
+        Ok((client, connection_task))
+    }
+
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, String> {
         let mut conn_str = format!("host={} port={}", config.host, config.port);
         if let Some(user) = &config.user {
@@ -38,367 +55,69 @@ impl PostgresDriver {
             }
         }
 
-        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Connect three parallel contexts
+        let (main_res, metadata_res, utility_res) = tokio::join!(
+            Self::connect_single(&conn_str),
+            Self::connect_single(&conn_str),
+            Self::connect_single(&conn_str),
+        );
 
-        let connection_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("Postgres connection error: {}", e);
-            }
-        });
+        let (main_client, main_task) = main_res?;
+        let (metadata_client, metadata_task) = metadata_res?;
+        let (utility_client, utility_task) = utility_res?;
 
-        let client_arc = Arc::new(client);
-        let context = Arc::new(PostgresExecutionContext::new(client_arc.clone()).await?);
+        let main_arc = Arc::new(main_client);
+        let metadata_arc = Arc::new(metadata_client);
+        let utility_arc = Arc::new(utility_client);
+
+        let main_context = Arc::new(PostgresExecutionContext::new(main_arc).await?);
+        let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc).await?);
+        let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc).await?);
 
         Ok(Self {
-            client: client_arc,
-            context,
-            _connection_task: connection_task,
+            main_context,
+            metadata_context,
+            utility_context,
+            _connection_tasks: vec![main_task, metadata_task, utility_task],
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
-    }
-}
-
-pub struct PostgresExecutionContext {
-    client: Arc<Client>,
-    active_schema: tokio::sync::Mutex<String>,
-}
-
-impl PostgresExecutionContext {
-    pub async fn new(client: Arc<Client>) -> Result<Self, String> {
-        let rows = client
-            .query("SELECT current_schema()", &[])
-            .await
-            .map_err(|e| e.to_string())?;
-        let active_schema = if let Some(row) = rows.first() {
-            row.get::<_, Option<String>>(0)
-                .unwrap_or_else(|| "public".to_string())
-        } else {
-            "public".to_string()
-        };
-        Ok(Self {
-            client,
-            active_schema: tokio::sync::Mutex::new(active_schema),
-        })
-    }
-}
-
-#[async_trait]
-impl ExecutionContext for PostgresExecutionContext {
-    async fn get_active_schema(&self) -> Result<String, String> {
-        let schema = self.active_schema.lock().await;
-        Ok(schema.clone())
-    }
-
-    async fn set_active_schema(&self, schema: &str) -> Result<(), String> {
-        let escaped = schema.replace("\"", "\"\"");
-        self.client
-            .execute(&format!("SET search_path TO \"{}\"", escaped), &[])
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut active = self.active_schema.lock().await;
-        *active = schema.to_string();
-        Ok(())
-    }
-
-    async fn get_search_path(&self) -> Result<Vec<String>, String> {
-        let rows = self
-            .client
-            .query("SHOW search_path", &[])
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(row) = rows.first() {
-            let path_str: String = row.get(0);
-            let paths = path_str
-                .split(',')
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .collect();
-            Ok(paths)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    async fn open_session(&self, _purpose: &str) -> Result<Box<dyn DbSession>, String> {
-        Ok(Box::new(PostgresSession {
-            client: self.client.clone(),
-        }))
-    }
-}
-
-pub struct PostgresSession {
-    client: Arc<Client>,
-}
-
-#[async_trait]
-impl DbSession for PostgresSession {
-    async fn prepare_statement(&self, sql: &str) -> Result<Box<dyn DbStatement>, String> {
-        let stmt = self.client.prepare(sql).await.map_err(|e| e.to_string())?;
-        Ok(Box::new(PostgresStatement {
-            client: self.client.clone(),
-            stmt,
-            _fetch_size: 100,
-            _timeout_seconds: None,
-        }))
-    }
-}
-
-pub struct PostgresStatement {
-    client: Arc<Client>,
-    stmt: tokio_postgres::Statement,
-    _fetch_size: usize,
-    _timeout_seconds: Option<u32>,
-}
-
-#[async_trait]
-impl DbStatement for PostgresStatement {
-    async fn execute_query(&self) -> Result<Box<dyn DbResultSet>, String> {
-        let row_stream = self
-            .client
-            .query_raw(&self.stmt, std::iter::empty::<Option<i32>>())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let columns = self
-            .stmt
-            .columns()
-            .iter()
-            .map(|c| ColumnInfo {
-                name: c.name().to_string(),
-                data_type: c.type_().name().to_string(),
-            })
-            .collect();
-
-        Ok(Box::new(PostgresResultSet {
-            columns,
-            stream: tokio::sync::Mutex::new(Box::pin(row_stream)),
-        }))
-    }
-
-    async fn execute_update(&self) -> Result<u64, String> {
-        let rows_affected = self
-            .client
-            .execute(&self.stmt, &[])
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(rows_affected)
-    }
-
-    fn set_fetch_size(&mut self, size: usize) {
-        self._fetch_size = size;
-    }
-
-    fn set_query_timeout(&mut self, seconds: u32) {
-        self._timeout_seconds = Some(seconds);
-    }
-}
-
-pub struct PostgresResultSet {
-    columns: Vec<ColumnInfo>,
-    stream: tokio::sync::Mutex<
-        Pin<
-            Box<
-                dyn Stream<Item = Result<tokio_postgres::Row, tokio_postgres::Error>>
-                    + Send,
-            >,
-        >,
-    >,
-}
-
-#[async_trait]
-impl DbResultSet for PostgresResultSet {
-    fn get_metadata(&self) -> Result<Vec<ColumnInfo>, String> {
-        Ok(self.columns.clone())
-    }
-
-    async fn next_row_batch(&mut self, batch_size: usize) -> Result<Option<RowBatch>, String> {
-        let mut stream = self.stream.lock().await;
-        let mut rows = Vec::new();
-
-        for _ in 0..batch_size {
-            match stream.next().await {
-                Some(Ok(row)) => {
-                    let mut row_values = Vec::new();
-                    for i in 0..row.len() {
-                        row_values.push(pg_value_to_json(&row, i));
-                    }
-                    rows.push(row_values);
-                }
-                Some(Err(e)) => return Err(e.to_string()),
-                None => break,
-            }
-        }
-
-        if rows.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(RowBatch {
-                columns: self.columns.clone(),
-                rows,
-            }))
-        }
-    }
-}
-
-struct RawValue<'a>(&'a [u8]);
-
-impl<'a> tokio_postgres::types::FromSql<'a> for RawValue<'a> {
-    fn from_sql(
-        _ty: &tokio_postgres::types::Type,
-        raw: &'a [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(RawValue(raw))
-    }
-
-    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
-        true
-    }
-}
-
-fn pg_value_to_json(row: &tokio_postgres::Row, index: usize) -> serde_json::Value {
-    let col = &row.columns()[index];
-    let ty = col.type_();
-
-    match *ty {
-        tokio_postgres::types::Type::BOOL => match row.try_get::<_, Option<bool>>(index) {
-            Ok(Some(val)) => serde_json::Value::Bool(val),
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::INT2 => match row.try_get::<_, Option<i16>>(index) {
-            Ok(Some(val)) => serde_json::Value::Number(val.into()),
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::INT4 => match row.try_get::<_, Option<i32>>(index) {
-            Ok(Some(val)) => serde_json::Value::Number(val.into()),
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::INT8 => match row.try_get::<_, Option<i64>>(index) {
-            Ok(Some(val)) => serde_json::Value::Number(val.into()),
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::FLOAT4 => match row.try_get::<_, Option<f32>>(index) {
-            Ok(Some(val)) => {
-                if let Some(n) = serde_json::Number::from_f64(val as f64) {
-                    serde_json::Value::Number(n)
-                } else {
-                    serde_json::Value::Null
-                }
-            }
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::FLOAT8 => match row.try_get::<_, Option<f64>>(index) {
-            Ok(Some(val)) => {
-                if let Some(n) = serde_json::Number::from_f64(val) {
-                    serde_json::Value::Number(n)
-                } else {
-                    serde_json::Value::Null
-                }
-            }
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::VARCHAR
-        | tokio_postgres::types::Type::TEXT
-        | tokio_postgres::types::Type::BPCHAR
-        | tokio_postgres::types::Type::NAME => match row.try_get::<_, Option<String>>(index) {
-            Ok(Some(val)) => serde_json::Value::String(val),
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::JSON | tokio_postgres::types::Type::JSONB => {
-            match row.try_get::<_, Option<serde_json::Value>>(index) {
-                Ok(Some(val)) => val,
-                _ => serde_json::Value::Null,
-            }
-        }
-        tokio_postgres::types::Type::TIMESTAMP | tokio_postgres::types::Type::TIMESTAMPTZ => {
-            if let Ok(val_opt) = row.try_get::<_, Option<chrono::NaiveDateTime>>(index) {
-                match val_opt {
-                    Some(val) => serde_json::Value::String(val.to_string()),
-                    None => serde_json::Value::Null,
-                }
-            } else if let Ok(val_opt) =
-                row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(index)
-            {
-                match val_opt {
-                    Some(val) => serde_json::Value::String(val.to_string()),
-                    None => serde_json::Value::Null,
-                }
-            } else {
-                serde_json::Value::String("<timestamp>".to_string())
-            }
-        }
-        tokio_postgres::types::Type::DATE => {
-            if let Ok(val_opt) = row.try_get::<_, Option<chrono::NaiveDate>>(index) {
-                match val_opt {
-                    Some(val) => serde_json::Value::String(val.to_string()),
-                    None => serde_json::Value::Null,
-                }
-            } else {
-                serde_json::Value::String("<date>".to_string())
-            }
-        }
-        tokio_postgres::types::Type::UUID => match row.try_get::<_, Option<uuid::Uuid>>(index) {
-            Ok(Some(val)) => serde_json::Value::String(val.to_string()),
-            _ => serde_json::Value::Null,
-        },
-        tokio_postgres::types::Type::NUMERIC => {
-            match row.try_get::<_, Option<rust_decimal::Decimal>>(index) {
-                Ok(Some(val)) => serde_json::to_value(val).unwrap_or(serde_json::Value::Null),
-                _ => serde_json::Value::Null,
-            }
-        }
-        _ => {
-            if let tokio_postgres::types::Kind::Enum(_) = ty.kind() {
-                if let Ok(Some(raw_val)) = row.try_get::<_, Option<RawValue>>(index) {
-                    if let Ok(s) = std::str::from_utf8(raw_val.0) {
-                        return serde_json::Value::String(s.to_string());
-                    }
-                }
-            }
-
-            if let Ok(Some(val)) = row.try_get::<_, Option<String>>(index) {
-                serde_json::Value::String(val)
-            } else {
-                if let Ok(None) = row.try_get::<_, Option<String>>(index) {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(format!("<type: {}>", ty.name()))
-                }
-            }
-        }
     }
 }
 
 #[async_trait]
 impl DataSource for PostgresDriver {
     async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, String> {
-        Ok(self.context.clone())
+        Ok(self.main_context.clone())
     }
 
-    async fn open_context(&self, _purpose: &str) -> Result<Arc<dyn ExecutionContext>, String> {
-        let ctx = PostgresExecutionContext::new(self.client.clone()).await?;
-        Ok(Arc::new(ctx))
+    async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, String> {
+        match purpose {
+            "metadata" => Ok(self.metadata_context.clone()),
+            "plan" | "utility" | "cancel" => Ok(self.utility_context.clone()),
+            _ => Ok(self.main_context.clone()),
+        }
     }
 
     async fn get_server_version(&self) -> Result<String, String> {
-        let rows = self
-            .client
-            .query("SELECT version()", &[])
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(row) = rows.first() {
-            let version: String = row.get(0);
-            Ok(version)
-        } else {
-            Err("Failed to query version".to_string())
+        let ctx = self.open_context("utility").await?;
+        let session = ctx.open_session("utility").await?;
+        let stmt = session.prepare_statement("SELECT version()").await?;
+        let mut rs = stmt.execute_query().await?;
+        if let Some(batch) = rs.next_row_batch(1).await? {
+            if let Some(row) = batch.rows.first() {
+                if let Some(serde_json::Value::String(version)) = row.first() {
+                    return Ok(version.clone());
+                }
+            }
         }
+        Err("Failed to query version".to_string())
     }
 }
 
 #[async_trait]
 impl RelationalDriver for PostgresDriver {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, String> {
-        let ctx = self.get_default_context().await?;
+        let ctx = self.open_context("metadata").await?;
         let session = ctx.open_session("metadata").await?;
         let stmt = session
             .prepare_statement(
@@ -421,7 +140,7 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, String> {
-        let ctx = self.get_default_context().await?;
+        let ctx = self.open_context("metadata").await?;
         let session = ctx.open_session("metadata").await?;
         let escaped_schema = schema.replace("'", "''");
         let sql = format!(
@@ -454,7 +173,7 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, String> {
-        let ctx = self.get_default_context().await?;
+        let ctx = self.open_context("metadata").await?;
         let session = ctx.open_session("metadata").await?;
         let escaped_schema = schema.replace("'", "''");
         let escaped_table = table.replace("'", "''");
@@ -501,7 +220,7 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, String> {
-        let ctx = self.get_default_context().await?;
+        let ctx = self.open_context("metadata").await?;
         let session = ctx.open_session("metadata").await?;
         let escaped_schema = schema.replace("'", "''");
 
@@ -605,7 +324,7 @@ impl RelationalDriver for PostgresDriver {
         batch_size: usize,
         offset: Option<usize>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, String>> + Send>>, String> {
-        let cancel_token = self.client.cancel_token();
+        let cancel_token = self.main_context.cancel_token();
         self.cancel_tokens
             .lock()
             .await
@@ -622,7 +341,7 @@ impl RelationalDriver for PostgresDriver {
             }
         }
 
-        let ctx = self.get_default_context().await?;
+        let ctx = self.open_context("query").await?;
         let session = ctx.open_session("query").await?;
         let mut stmt = session.prepare_statement(&final_sql).await?;
         stmt.set_fetch_size(batch_size);
