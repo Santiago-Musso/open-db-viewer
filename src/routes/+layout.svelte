@@ -25,6 +25,6 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div style="zoom: {zoomLevel}; width: {100 / zoomLevel}vw; height: {100 / zoomLevel}vh; overflow: hidden; display: flex; flex-direction: column;">
+<div style="transform: scale({zoomLevel}); transform-origin: top left; width: {100 / zoomLevel}vw; height: {100 / zoomLevel}vh; overflow: hidden; display: flex; flex-direction: column;">
   {@render children()}
 </div>
