@@ -78,6 +78,18 @@
         overscan: 10,
       });
     });
+    
+    // Infinite scrolling detection
+    const items = $virtualizer.getVirtualItems();
+    if (items.length > 0) {
+      const lastItem = items[items.length - 1];
+      const tab = appState.activeTab;
+      if (tab && !tab.loading && !tab.isFullyLoaded && lastItem.index >= rows.length - 5) {
+        untrack(() => {
+          appState.executeQuery(true);
+        });
+      }
+    }
   });
 
   let columnTemplate = $derived(columnWidths.map(w => `${Math.max(50, w)}px`).join(' '));

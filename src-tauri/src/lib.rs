@@ -128,10 +128,11 @@ async fn execute_query(
     query_id: String,
     sql: String,
     batch_size: usize,
+    offset: Option<usize>,
 ) -> Result<(), String> {
     let driver = state.manager.get_relational(&connection_id)?;
     let mut stream = driver
-        .execute_query_stream(&query_id, &sql, batch_size)
+        .execute_query_stream(&query_id, &sql, batch_size, offset)
         .await?;
 
     tokio::spawn(async move {

@@ -272,25 +272,23 @@ impl RelationalDriver for PostgresDriver {
             });
         }
 
-        // Fetch all foreign key constraints
+        // Fetch all foreign key constraints using pg_catalog to avoid information_schema privilege bugs
         let rows = self
             .client
             .query(
-                "SELECT \
-                    tc.constraint_name, \
-                    tc.table_name AS source_table, \
-                    kcu.column_name AS source_column, \
-                    ccu.table_name AS target_table, \
-                    ccu.column_name AS target_column \
-                 FROM \
-                    information_schema.table_constraints AS tc \
-                    JOIN information_schema.key_column_usage AS kcu \
-                      ON tc.constraint_name = kcu.constraint_name \
-                      AND tc.table_schema = kcu.table_schema \
-                    JOIN information_schema.constraint_column_usage AS ccu \
-                      ON ccu.constraint_name = tc.constraint_name \
-                      AND ccu.table_schema = tc.table_schema \
-                 WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1",
+                "SELECT 
+                    c.conname AS constraint_name, 
+                    cl1.relname AS source_table, 
+                    a1.attname AS source_column, 
+                    cl2.relname AS target_table, 
+                    a2.attname AS target_column 
+                 FROM pg_constraint c 
+                 JOIN pg_class cl1 ON c.conrelid = cl1.oid 
+                 JOIN pg_class cl2 ON c.confrelid = cl2.oid 
+                 JOIN pg_namespace n1 ON cl1.relnamespace = n1.oid 
+                 JOIN pg_attribute a1 ON a1.attnum = ANY(c.conkey) AND a1.attrelid = cl1.oid 
+                 JOIN pg_attribute a2 ON a2.attnum = ANY(c.confkey) AND a2.attrelid = cl2.oid 
+                 WHERE c.contype = 'f' AND n1.nspname = $1",
                 &[&schema],
             )
             .await
@@ -321,6 +319,7 @@ impl RelationalDriver for PostgresDriver {
         query_id: &str,
         sql: &str,
         batch_size: usize,
+        offset: Option<usize>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, String>> + Send>>, String> {
         let cancel_token = self.client.cancel_token();
         self.cancel_tokens
@@ -328,7 +327,15 @@ impl RelationalDriver for PostgresDriver {
             .await
             .insert(query_id.to_string(), cancel_token);
 
-        let stmt = self.client.prepare(sql).await.map_err(|e| e.to_string())?;
+        let mut final_sql = sql.to_string();
+        if let Some(off) = offset {
+            let lower = sql.trim().to_lowercase();
+            if lower.starts_with("select") || lower.starts_with("with") {
+                final_sql = format!("SELECT * FROM ({}) AS _odv_wrapper LIMIT {} OFFSET {}", sql, batch_size, off);
+            }
+        }
+
+        let stmt = self.client.prepare(&final_sql).await.map_err(|e| e.to_string())?;
         let columns: Vec<ColumnInfo> = stmt
             .columns()
             .iter()

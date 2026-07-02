@@ -24,6 +24,8 @@ export interface Tab {
   error: string | null;
   executionTime: number | null; // in ms
   rowCount: number;
+  offset: number;
+  isFullyLoaded: boolean;
 }
 
 class AppState {
@@ -60,8 +62,12 @@ class AppState {
           if (tab.columns.length === 0) {
             tab.columns = batch.columns;
           }
-          tab.rows = [...tab.rows, ...batch.rows];
-          tab.rowCount += batch.rows.len || batch.rows.length;
+          tab.rows.push(...batch.rows);
+          tab.rowCount += (batch.rows.len || batch.rows.length);
+          
+          if ((batch.rows.len || batch.rows.length) < 100) {
+            tab.isFullyLoaded = true;
+          }
         }
       });
 
@@ -79,7 +85,7 @@ class AppState {
         const tab = this.tabs.find((t) => t.queryId === query_id);
         if (tab) {
           tab.loading = false;
-          tab.rowCount = row_count;
+          tab.offset += row_count;
         }
       });
     }
@@ -454,6 +460,8 @@ class AppState {
       error: null,
       executionTime: null,
       rowCount: 0,
+      offset: 0,
+      isFullyLoaded: false,
     };
     this.tabs.push(newTab);
     this.activeTabId = id;
@@ -476,16 +484,21 @@ class AppState {
     return this.tabs.find((t) => t.id === this.activeTabId) || null;
   }
 
-  async executeQuery() {
+  async executeQuery(isNextPage: boolean = false) {
     const tab = this.activeTab;
     if (!tab || !this.activeConnectionId || tab.loading) return;
 
     tab.loading = true;
     tab.error = null;
-    tab.columns = [];
-    tab.rows = [];
-    tab.rowCount = 0;
-    tab.executionTime = null;
+    
+    if (!isNextPage) {
+      tab.columns = [];
+      tab.rows = [];
+      tab.rowCount = 0;
+      tab.offset = 0;
+      tab.isFullyLoaded = false;
+      tab.executionTime = null;
+    }
     
     const queryId = crypto.randomUUID();
     tab.queryId = queryId;
@@ -496,7 +509,8 @@ class AppState {
         connectionId: this.activeConnectionId,
         queryId,
         sql: tab.sql,
-        batchSize: 500,
+        batchSize: 100,
+        offset: tab.offset
       });
       tab.executionTime = Math.round(performance.now() - start);
 
@@ -576,6 +590,8 @@ class AppState {
             error: null,
             executionTime: null,
             rowCount: 0,
+            offset: 0,
+            isFullyLoaded: false,
           }));
           this.activeTabId = state.active_tab_id;
         }

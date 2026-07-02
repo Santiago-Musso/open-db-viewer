@@ -90,6 +90,7 @@ pub trait RelationalDriver: Send + Sync {
         query_id: &str,
         sql: &str,
         batch_size: usize,
+        offset: Option<usize>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, String>> + Send>>, String>;
     async fn cancel_query(&self, query_id: &str) -> Result<(), String>;
 }
