@@ -98,8 +98,8 @@ pub struct SchemaEdge {
     pub target: String,
     pub source_handle: String,
     pub target_handle: String,
-    pub match_type: Option<String>,     // FULL, PARTIAL, SIMPLE
-    pub update_rule: Option<String>,    // CASCADE, RESTRICT, SET_NULL, SET_DEFAULT, NO_ACTION
+    pub match_type: Option<String>,  // FULL, PARTIAL, SIMPLE
+    pub update_rule: Option<String>, // CASCADE, RESTRICT, SET_NULL, SET_DEFAULT, NO_ACTION
     pub delete_rule: Option<String>,
 }
 
@@ -116,8 +116,8 @@ pub struct IndexInfo {
     pub is_unique: bool,
     pub is_primary: bool,
     pub columns: Vec<String>,
-    pub index_type: Option<String>,  // btree, hash, gist, gin, etc.
-    pub predicate: Option<String>,   // partial index expression
+    pub index_type: Option<String>, // btree, hash, gist, gin, etc.
+    pub predicate: Option<String>,  // partial index expression
     pub description: Option<String>,
 }
 
@@ -136,7 +136,7 @@ pub struct ConstraintInfo {
     pub table_name: String,
     pub constraint_type: ConstraintType,
     pub columns: Vec<String>,
-    pub definition: String,               // from pg_get_constraintdef
+    pub definition: String, // from pg_get_constraintdef
     pub description: Option<String>,
 }
 
@@ -198,7 +198,8 @@ pub trait SqlDialect: Send + Sync {
 #[async_trait]
 pub trait DataSource: Send + Sync {
     async fn get_default_context(&self) -> Result<Arc<dyn ExecutionContext>, DatabaseError>;
-    async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, DatabaseError>;
+    async fn open_context(&self, purpose: &str)
+        -> Result<Arc<dyn ExecutionContext>, DatabaseError>;
     async fn get_server_version(&self) -> Result<String, DatabaseError>;
     fn get_dialect(&self) -> Arc<dyn SqlDialect>;
 }
@@ -230,14 +231,18 @@ pub trait DbStatement: Send + Sync {
 #[async_trait]
 pub trait DbResultSet: Send + Sync {
     fn get_metadata(&self) -> Result<Vec<ColumnInfo>, DatabaseError>;
-    async fn next_row_batch(&mut self, batch_size: usize) -> Result<Option<RowBatch>, DatabaseError>;
+    async fn next_row_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Option<RowBatch>, DatabaseError>;
 }
 
 #[async_trait]
 pub trait RelationalDriver: Send + Sync {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, DatabaseError>;
     async fn list_tables(&self, schema: &str) -> Result<Vec<TableInfo>, DatabaseError>;
-    async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, DatabaseError>;
+    async fn describe_table(&self, schema: &str, table: &str)
+        -> Result<TableSchema, DatabaseError>;
     async fn get_table_ddl(&self, schema: &str, table: &str) -> Result<String, DatabaseError>;
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, DatabaseError>;
     async fn execute_query_stream(
@@ -254,22 +259,45 @@ pub trait RelationalDriver: Send + Sync {
     async fn refresh_table(&self, _schema: &str, _table: &str) -> Result<(), DatabaseError> {
         Ok(())
     }
-    async fn get_execution_plan(&self, _sql: &str, _options: ExplainOptions) -> Result<PlanNode, DatabaseError> {
-        Err(DatabaseError::new("Explain plan is not supported by this driver".to_string()))
+    async fn get_execution_plan(
+        &self,
+        _sql: &str,
+        _options: ExplainOptions,
+    ) -> Result<PlanNode, DatabaseError> {
+        Err(DatabaseError::new(
+            "Explain plan is not supported by this driver".to_string(),
+        ))
     }
-    async fn list_active_sessions(&self, _show_idle: bool) -> Result<Vec<DbSessionInfo>, DatabaseError> {
-        Err(DatabaseError::new("Session management is not supported by this driver".to_string()))
+    async fn list_active_sessions(
+        &self,
+        _show_idle: bool,
+    ) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+        Err(DatabaseError::new(
+            "Session management is not supported by this driver".to_string(),
+        ))
     }
     async fn cancel_session(&self, _pid: i32) -> Result<(), DatabaseError> {
-        Err(DatabaseError::new("Session cancel is not supported by this driver".to_string()))
+        Err(DatabaseError::new(
+            "Session cancel is not supported by this driver".to_string(),
+        ))
     }
     async fn terminate_session(&self, _pid: i32) -> Result<(), DatabaseError> {
-        Err(DatabaseError::new("Session termination is not supported by this driver".to_string()))
+        Err(DatabaseError::new(
+            "Session termination is not supported by this driver".to_string(),
+        ))
     }
-    async fn list_indexes(&self, _schema: &str, _table: &str) -> Result<Vec<IndexInfo>, DatabaseError> {
+    async fn list_indexes(
+        &self,
+        _schema: &str,
+        _table: &str,
+    ) -> Result<Vec<IndexInfo>, DatabaseError> {
         Ok(Vec::new())
     }
-    async fn list_constraints(&self, _schema: &str, _table: &str) -> Result<Vec<ConstraintInfo>, DatabaseError> {
+    async fn list_constraints(
+        &self,
+        _schema: &str,
+        _table: &str,
+    ) -> Result<Vec<ConstraintInfo>, DatabaseError> {
         Ok(Vec::new())
     }
     async fn list_sequences(&self, _schema: &str) -> Result<Vec<SequenceInfo>, DatabaseError> {
@@ -282,7 +310,9 @@ pub trait RelationalDriver: Send + Sync {
         Ok(Vec::new())
     }
     async fn get_view_ddl(&self, _schema: &str, _view: &str) -> Result<String, DatabaseError> {
-        Err(DatabaseError::new("Views not supported by this driver".to_string()))
+        Err(DatabaseError::new(
+            "Views not supported by this driver".to_string(),
+        ))
     }
     async fn refresh_all(&self) -> Result<(), DatabaseError> {
         Ok(())
@@ -355,4 +385,3 @@ pub trait KeyValueDriver: Send + Sync {
     async fn delete_key(&self, key: &str) -> Result<(), String>;
     async fn server_info(&self) -> Result<ServerInfo, String>;
 }
-

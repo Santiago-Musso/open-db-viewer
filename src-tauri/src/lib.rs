@@ -3,8 +3,8 @@ mod productivity;
 mod state;
 
 use driver_api::{
-    ConnectionConfig, KeyValue, ScanResult, SchemaGraph, SchemaInfo, ServerInfo, TableInfo,
-    TableSchema, DatabaseError, PlanNode, DbSessionInfo, ExplainOptions,
+    ConnectionConfig, DatabaseError, DbSessionInfo, ExplainOptions, KeyValue, PlanNode, ScanResult,
+    SchemaGraph, SchemaInfo, ServerInfo, TableInfo, TableSchema,
 };
 use state::AppState;
 use std::fs::File;
@@ -68,7 +68,10 @@ async fn list_schemas(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> Result<Vec<SchemaInfo>, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.list_schemas().await
 }
 
@@ -78,7 +81,10 @@ async fn list_tables(
     connection_id: String,
     schema: String,
 ) -> Result<Vec<TableInfo>, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.list_tables(&schema).await
 }
 
@@ -89,7 +95,10 @@ async fn describe_table(
     schema: String,
     table: String,
 ) -> Result<TableSchema, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.describe_table(&schema, &table).await
 }
 
@@ -100,7 +109,10 @@ async fn get_table_ddl(
     schema: String,
     table: String,
 ) -> Result<String, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.get_table_ddl(&schema, &table).await
 }
 
@@ -110,7 +122,10 @@ async fn get_schema_graph(
     connection_id: String,
     schema: String,
 ) -> Result<SchemaGraph, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.get_schema_graph(&schema).await
 }
 
@@ -124,7 +139,10 @@ async fn execute_query(
     batch_size: usize,
     offset: Option<usize>,
 ) -> Result<(), DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     let mut stream = driver
         .execute_query_stream(&query_id, &sql, batch_size, offset)
         .await?;
@@ -173,7 +191,10 @@ async fn cancel_query(
     connection_id: String,
     query_id: String,
 ) -> Result<(), DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.cancel_query(&query_id).await
 }
 
@@ -184,7 +205,10 @@ async fn refresh_metadata_cache(
     schema: Option<String>,
     table: Option<String>,
 ) -> Result<(), DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     if let Some(tbl) = table {
         if let Some(sch) = schema {
             driver.refresh_table(&sch, &tbl).await?;
@@ -204,7 +228,10 @@ async fn get_execution_plan(
     sql: String,
     options: Option<ExplainOptions>,
 ) -> Result<PlanNode, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     let opts = options.unwrap_or(ExplainOptions {
         analyze: false,
         verbose: false,
@@ -222,8 +249,13 @@ async fn list_active_sessions(
     connection_id: String,
     show_idle: Option<bool>,
 ) -> Result<Vec<DbSessionInfo>, DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
-    driver.list_active_sessions(show_idle.unwrap_or(false)).await
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
+    driver
+        .list_active_sessions(show_idle.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -232,7 +264,10 @@ async fn cancel_session(
     connection_id: String,
     pid: i32,
 ) -> Result<(), DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.cancel_session(pid).await
 }
 
@@ -242,7 +277,10 @@ async fn terminate_session(
     connection_id: String,
     pid: i32,
 ) -> Result<(), DatabaseError> {
-    let driver = state.manager.get_relational(&connection_id).map_err(DatabaseError::from)?;
+    let driver = state
+        .manager
+        .get_relational(&connection_id)
+        .map_err(DatabaseError::from)?;
     driver.terminate_session(pid).await
 }
 

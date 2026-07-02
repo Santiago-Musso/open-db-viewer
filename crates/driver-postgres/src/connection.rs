@@ -1,22 +1,24 @@
+use crate::dialect::PostgreDialect;
+use crate::types::CustomTypeRegistry;
 use async_trait::async_trait;
 use driver_api::{
-    ColumnInfo, DbResultSet, DbSession, DbStatement, ExecutionContext, RowBatch, SqlDialect,
-    DatabaseError, ErrorCategory,
+    ColumnInfo, DatabaseError, DbResultSet, DbSession, DbStatement, ErrorCategory,
+    ExecutionContext, RowBatch, SqlDialect,
 };
 use futures_util::Stream;
 use futures_util::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_postgres::Client;
-use crate::dialect::PostgreDialect;
-use crate::types::CustomTypeRegistry;
 
 pub fn map_db_error(e: tokio_postgres::Error) -> DatabaseError {
     if let Some(db_err) = e.as_db_error() {
         let sql_state = db_err.code().code().to_string();
         let position = match db_err.position() {
             Some(tokio_postgres::error::ErrorPosition::Original(pos)) => Some(*pos as usize),
-            Some(tokio_postgres::error::ErrorPosition::Internal { position, .. }) => Some(*position as usize),
+            Some(tokio_postgres::error::ErrorPosition::Internal { position, .. }) => {
+                Some(*position as usize)
+            }
             None => None,
         };
 
@@ -62,7 +64,10 @@ pub struct PostgresExecutionContext {
 }
 
 impl PostgresExecutionContext {
-    pub async fn new(client: Arc<Client>, type_registry: Arc<CustomTypeRegistry>) -> Result<Self, DatabaseError> {
+    pub async fn new(
+        client: Arc<Client>,
+        type_registry: Arc<CustomTypeRegistry>,
+    ) -> Result<Self, DatabaseError> {
         let rows = client
             .query("SELECT current_schema()", &[])
             .await
@@ -100,11 +105,17 @@ impl driver_api::TransactionManager for PostgresExecutionContext {
         if *ac != enabled {
             *ac = enabled;
             if !enabled {
-                self.client.execute("BEGIN", &[]).await.map_err(map_db_error)?;
+                self.client
+                    .execute("BEGIN", &[])
+                    .await
+                    .map_err(map_db_error)?;
                 *in_tx = true;
             } else {
                 if *in_tx {
-                    self.client.execute("COMMIT", &[]).await.map_err(map_db_error)?;
+                    self.client
+                        .execute("COMMIT", &[])
+                        .await
+                        .map_err(map_db_error)?;
                     *in_tx = false;
                 }
             }
@@ -116,11 +127,17 @@ impl driver_api::TransactionManager for PostgresExecutionContext {
         let ac = self.auto_commit.lock().await;
         let mut in_tx = self.in_transaction.lock().await;
         if *in_tx {
-            self.client.execute("COMMIT", &[]).await.map_err(map_db_error)?;
+            self.client
+                .execute("COMMIT", &[])
+                .await
+                .map_err(map_db_error)?;
             *in_tx = false;
         }
         if !*ac {
-            self.client.execute("BEGIN", &[]).await.map_err(map_db_error)?;
+            self.client
+                .execute("BEGIN", &[])
+                .await
+                .map_err(map_db_error)?;
             *in_tx = true;
         }
         Ok(())
@@ -130,11 +147,17 @@ impl driver_api::TransactionManager for PostgresExecutionContext {
         let ac = self.auto_commit.lock().await;
         let mut in_tx = self.in_transaction.lock().await;
         if *in_tx {
-            self.client.execute("ROLLBACK", &[]).await.map_err(map_db_error)?;
+            self.client
+                .execute("ROLLBACK", &[])
+                .await
+                .map_err(map_db_error)?;
             *in_tx = false;
         }
         if !*ac {
-            self.client.execute("BEGIN", &[]).await.map_err(map_db_error)?;
+            self.client
+                .execute("BEGIN", &[])
+                .await
+                .map_err(map_db_error)?;
             *in_tx = true;
         }
         Ok(())
@@ -269,15 +292,11 @@ impl DbStatement for PostgresStatement {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub struct PostgresResultSet {
     columns: Vec<ColumnInfo>,
     stream: tokio::sync::Mutex<
-        Pin<
-            Box<
-                dyn Stream<Item = Result<tokio_postgres::Row, tokio_postgres::Error>>
-                    + Send,
-            >,
-        >,
+        Pin<Box<dyn Stream<Item = Result<tokio_postgres::Row, tokio_postgres::Error>> + Send>>,
     >,
     type_registry: Arc<CustomTypeRegistry>,
     exhausted: std::sync::atomic::AtomicBool,
@@ -289,7 +308,10 @@ impl DbResultSet for PostgresResultSet {
         Ok(self.columns.clone())
     }
 
-    async fn next_row_batch(&mut self, batch_size: usize) -> Result<Option<RowBatch>, DatabaseError> {
+    async fn next_row_batch(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Option<RowBatch>, DatabaseError> {
         if self.exhausted.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(None);
         }
@@ -302,13 +324,18 @@ impl DbResultSet for PostgresResultSet {
                 Some(Ok(row)) => {
                     let mut row_values = Vec::new();
                     for i in 0..row.len() {
-                        row_values.push(crate::types::pg_value_to_json(&row, i, Some(&self.type_registry)));
+                        row_values.push(crate::types::pg_value_to_json(
+                            &row,
+                            i,
+                            Some(&self.type_registry),
+                        ));
                     }
                     rows.push(row_values);
                 }
                 Some(Err(e)) => return Err(map_db_error(e)),
                 None => {
-                    self.exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.exhausted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     break;
                 }
             }
@@ -346,5 +373,3 @@ mod connection_tests {
         assert!(!db_err.message.is_empty());
     }
 }
-
-

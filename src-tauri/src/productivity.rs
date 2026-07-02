@@ -186,7 +186,10 @@ pub async fn export_query_results(
     format: String,
 ) -> Result<(), String> {
     let driver = state.manager.get_relational(&connection_id)?;
-    let mut stream = driver.execute_query_stream("export", &sql, 500, None).await.map_err(|e| e.to_string())?;
+    let mut stream = driver
+        .execute_query_stream("export", &sql, 500, None)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut file = std::fs::File::create(&file_path).map_err(|e| e.to_string())?;
 
     let mut is_first_batch = true;

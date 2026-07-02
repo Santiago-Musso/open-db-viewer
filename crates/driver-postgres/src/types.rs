@@ -15,6 +15,7 @@ pub struct CustomTypeInfo {
     pub description: Option<String>,
 }
 
+#[derive(Default)]
 pub struct CustomTypeRegistry {
     pub types: HashMap<u32, CustomTypeInfo>,
     pub by_name: HashMap<String, Vec<CustomTypeInfo>>,
@@ -132,7 +133,7 @@ pub fn decode_interval(raw: &[u8]) -> Result<serde_json::Value, String> {
 
     let years = months / 12;
     let remaining_months = months % 12;
-    
+
     let hours = microseconds / 3_600_000_000;
     let remaining_micros = microseconds % 3_600_000_000;
     let minutes = remaining_micros / 60_000_000;
@@ -141,13 +142,25 @@ pub fn decode_interval(raw: &[u8]) -> Result<serde_json::Value, String> {
 
     let mut parts = Vec::new();
     if years != 0 {
-        parts.push(format!("{} year{}", years, if years.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} year{}",
+            years,
+            if years.abs() == 1 { "" } else { "s" }
+        ));
     }
     if remaining_months != 0 {
-        parts.push(format!("{} month{}", remaining_months, if remaining_months.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} month{}",
+            remaining_months,
+            if remaining_months.abs() == 1 { "" } else { "s" }
+        ));
     }
     if days != 0 {
-        parts.push(format!("{} day{}", days, if days.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} day{}",
+            days,
+            if days.abs() == 1 { "" } else { "s" }
+        ));
     }
     if hours != 0 || minutes != 0 || seconds != 0.0 {
         parts.push(format!("{:02}:{:02}:{:06.3}", hours, minutes, seconds));
@@ -267,9 +280,7 @@ pub fn decode_raw_value(
                 serde_json::Value::Null
             }
         }
-        Type::XML => {
-            serde_json::Value::String(String::from_utf8_lossy(raw).into_owned())
-        }
+        Type::XML => serde_json::Value::String(String::from_utf8_lossy(raw).into_owned()),
         Type::MONEY => {
             if raw.len() == 8 {
                 let val = i64::from_be_bytes(raw.try_into().unwrap());
@@ -413,7 +424,7 @@ pub fn pg_value_to_json(
 
     if let tokio_postgres::types::Kind::Array(elem_ty) = ty.kind() {
         if let Ok(Some(raw_val)) = row.try_get::<_, Option<RawValue>>(index) {
-            if let Ok(arr) = decode_binary_array(raw_val.0, &elem_ty, registry) {
+            if let Ok(arr) = decode_binary_array(raw_val.0, elem_ty, registry) {
                 return arr;
             }
         }
@@ -445,8 +456,12 @@ pub fn pg_value_to_json(
                 if raw_val.0.len() == 6 {
                     let s = format!(
                         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        raw_val.0[0], raw_val.0[1], raw_val.0[2],
-                        raw_val.0[3], raw_val.0[4], raw_val.0[5]
+                        raw_val.0[0],
+                        raw_val.0[1],
+                        raw_val.0[2],
+                        raw_val.0[3],
+                        raw_val.0[4],
+                        raw_val.0[5]
                     );
                     serde_json::Value::String(s)
                 } else {
@@ -571,7 +586,9 @@ pub fn pg_value_to_json(
         _ => {
             if ty.name() == "hstore" {
                 match row.try_get::<_, Option<RawValue>>(index) {
-                    Ok(Some(raw)) => return decode_hstore(raw.0).unwrap_or(serde_json::Value::Null),
+                    Ok(Some(raw)) => {
+                        return decode_hstore(raw.0).unwrap_or(serde_json::Value::Null)
+                    }
                     _ => return serde_json::Value::Null,
                 }
             }
@@ -642,16 +659,11 @@ mod tests {
         });
 
         // Resolve OID
-        assert_eq!(
-            reg.get_by_oid(12000).unwrap().schema,
-            "public".to_string()
-        );
+        assert_eq!(reg.get_by_oid(12000).unwrap().schema, "public".to_string());
 
         // Resolve by qualified name
         assert_eq!(
-            reg.resolve_by_name("custom_schema.mood", &[])
-                .unwrap()
-                .oid,
+            reg.resolve_by_name("custom_schema.mood", &[]).unwrap().oid,
             12001
         );
 
@@ -664,9 +676,7 @@ mod tests {
 
         let search_path_other = vec!["public".to_string(), "custom_schema".to_string()];
         assert_eq!(
-            reg.resolve_by_name("mood", &search_path_other)
-                .unwrap()
-                .oid,
+            reg.resolve_by_name("mood", &search_path_other).unwrap().oid,
             12000
         );
     }
@@ -712,21 +722,24 @@ mod tests {
     fn test_decode_interval() {
         let raw = vec![
             0, 0, 0, 0, 0xD6, 0x93, 0xA4, 0x00, // 1 hour (micros)
-            0, 0, 0, 5,                         // 5 days
-            0, 0, 0, 14,                        // 14 months (1 year, 2 months)
+            0, 0, 0, 5, // 5 days
+            0, 0, 0, 14, // 14 months (1 year, 2 months)
         ];
         let val = decode_interval(&raw).unwrap();
-        assert_eq!(val, serde_json::Value::String("1 year 2 months 5 days 01:00:00.000".to_string()));
+        assert_eq!(
+            val,
+            serde_json::Value::String("1 year 2 months 5 days 01:00:00.000".to_string())
+        );
     }
 
     #[test]
     fn test_decode_hstore() {
         let raw = vec![
-            0, 0, 0, 2,                         // 2 pairs
-            0, 0, 0, 1, 97,                     // "a"
-            0, 0, 0, 1, 98,                     // "b"
-            0, 0, 0, 1, 120,                    // "x"
-            255, 255, 255, 255,                 // null
+            0, 0, 0, 2, // 2 pairs
+            0, 0, 0, 1, 97, // "a"
+            0, 0, 0, 1, 98, // "b"
+            0, 0, 0, 1, 120, // "x"
+            255, 255, 255, 255, // null
         ];
         let val = decode_hstore(&raw).unwrap();
         let mut map = serde_json::Map::new();

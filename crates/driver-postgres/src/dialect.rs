@@ -56,7 +56,10 @@ impl SqlDialect for PostgreDialect {
                     trimmed, limit, off
                 )
             } else {
-                format!("SELECT * FROM ({}) AS _odv_wrapper LIMIT {}", trimmed, limit)
+                format!(
+                    "SELECT * FROM ({}) AS _odv_wrapper LIMIT {}",
+                    trimmed, limit
+                )
             }
         } else {
             sql.to_string()
@@ -72,11 +75,11 @@ mod tests {
     fn test_quote_identifier() {
         let dialect = PostgreDialect::default();
         assert_eq!(dialect.quote_identifier("users"), "\"users\"");
-        assert_eq!(dialect.quote_identifier("public.users"), "\"public\".\"users\"");
         assert_eq!(
-            dialect.quote_identifier("my\"table"),
-            "\"my\"\"table\""
+            dialect.quote_identifier("public.users"),
+            "\"public\".\"users\""
         );
+        assert_eq!(dialect.quote_identifier("my\"table"), "\"my\"\"table\"");
     }
 
     #[test]

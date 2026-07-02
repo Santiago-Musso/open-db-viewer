@@ -18,7 +18,21 @@ where
             cache: RwLock::new(HashMap::new()),
         }
     }
+}
 
+impl<K, V> Default for ObjectLookupCache<K, V>
+where
+    K: Hash + Eq + Clone,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> ObjectLookupCache<K, V>
+where
+    K: Hash + Eq + Clone,
+{
     pub async fn get_or_load<F, Fut>(&self, key: K, loader: F) -> Result<Arc<V>, DatabaseError>
     where
         F: FnOnce() -> Fut,

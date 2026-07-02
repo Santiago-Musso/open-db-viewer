@@ -1,17 +1,17 @@
 use async_trait::async_trait;
 use driver_api::{
-    ColumnInfo, ConnectionConfig, DataSource, ExecutionContext, RelationalDriver, RowBatch,
-    SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode, TableInfo, TableSchema, SqlDialect,
-    DatabaseError, PlanNode, DbSessionInfo, TableKind, TableStats, IndexInfo, ConstraintInfo,
-    ConstraintType, SequenceInfo, ProcedureInfo, ExtensionInfo, ExplainOptions,
+    ColumnInfo, ConnectionConfig, ConstraintInfo, ConstraintType, DataSource, DatabaseError,
+    DbSessionInfo, ExecutionContext, ExplainOptions, ExtensionInfo, IndexInfo, PlanNode,
+    ProcedureInfo, RelationalDriver, RowBatch, SchemaEdge, SchemaGraph, SchemaInfo, SchemaNode,
+    SequenceInfo, SqlDialect, TableInfo, TableKind, TableSchema, TableStats,
 };
 use futures_util::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
-use std::sync::atomic::Ordering;
 
 pub mod connection;
 pub mod dialect;
@@ -19,7 +19,7 @@ pub mod metadata;
 pub mod plan;
 pub mod types;
 
-use connection::{PostgresExecutionContext, map_db_error};
+use connection::{map_db_error, PostgresExecutionContext};
 
 pub struct PostgresDriver {
     main_context: Arc<PostgresExecutionContext>,
@@ -39,7 +39,9 @@ pub struct PostgresDriver {
 }
 
 impl PostgresDriver {
-    async fn connect_single(conn_str: &str) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), String> {
+    async fn connect_single(
+        conn_str: &str,
+    ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), String> {
         let (client, connection) = tokio_postgres::connect(conn_str, NoTls)
             .await
             .map_err(|e| e.to_string())?;
@@ -89,9 +91,14 @@ impl PostgresDriver {
 
         // R8: standard_conforming_strings detection
         let dialect = Arc::new(dialect::PostgreDialect::default());
-        if let Ok(row) = utility_arc.query_one("SHOW standard_conforming_strings", &[]).await {
+        if let Ok(row) = utility_arc
+            .query_one("SHOW standard_conforming_strings", &[])
+            .await
+        {
             let scs_val: String = row.get(0);
-            dialect.standard_conforming_strings.store(scs_val == "on", Ordering::SeqCst);
+            dialect
+                .standard_conforming_strings
+                .store(scs_val == "on", Ordering::SeqCst);
         }
 
         // Fetch all custom type definitions (R17)
@@ -143,9 +150,21 @@ impl PostgresDriver {
         }
         let type_registry_arc = Arc::new(type_registry);
 
-        let main_context = Arc::new(PostgresExecutionContext::new(main_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
-        let metadata_context = Arc::new(PostgresExecutionContext::new(metadata_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
-        let utility_context = Arc::new(PostgresExecutionContext::new(utility_arc, type_registry_arc.clone()).await.map_err(|e| e.to_string())?);
+        let main_context = Arc::new(
+            PostgresExecutionContext::new(main_arc, type_registry_arc.clone())
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        let metadata_context = Arc::new(
+            PostgresExecutionContext::new(metadata_arc, type_registry_arc.clone())
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        let utility_context = Arc::new(
+            PostgresExecutionContext::new(utility_arc, type_registry_arc.clone())
+                .await
+                .map_err(|e| e.to_string())?,
+        );
 
         let schema_cache = metadata::ObjectLookupCache::new();
         let table_cache = metadata::ObjectLookupCache::new();
@@ -174,7 +193,10 @@ impl DataSource for PostgresDriver {
         Ok(self.main_context.clone())
     }
 
-    async fn open_context(&self, purpose: &str) -> Result<Arc<dyn ExecutionContext>, DatabaseError> {
+    async fn open_context(
+        &self,
+        purpose: &str,
+    ) -> Result<Arc<dyn ExecutionContext>, DatabaseError> {
         match purpose {
             "metadata" => Ok(self.metadata_context.clone()),
             "plan" | "utility" | "cancel" => Ok(self.utility_context.clone()),
@@ -206,22 +228,29 @@ impl DataSource for PostgresDriver {
 impl RelationalDriver for PostgresDriver {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>, DatabaseError> {
         let metadata_ctx = self.metadata_context.clone();
-        let val = self.schema_cache.get_or_load((), || async move {
-            let rows = metadata_ctx.client.query(
-                "SELECT n.nspname FROM pg_catalog.pg_namespace n \
+        let val = self
+            .schema_cache
+            .get_or_load((), || async move {
+                let rows = metadata_ctx
+                    .client
+                    .query(
+                        "SELECT n.nspname FROM pg_catalog.pg_namespace n \
                  WHERE nspname NOT LIKE 'pg_%' \
                    AND nspname <> 'information_schema' \
                  ORDER BY n.nspname",
-                &[],
-            ).await.map_err(map_db_error)?;
+                        &[],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
 
-            let mut schemas = Vec::new();
-            for row in rows {
-                let name: String = row.get(0);
-                schemas.push(SchemaInfo { name });
-            }
-            Ok(schemas)
-        }).await?;
+                let mut schemas = Vec::new();
+                for row in rows {
+                    let name: String = row.get(0);
+                    schemas.push(SchemaInfo { name });
+                }
+                Ok(schemas)
+            })
+            .await?;
         Ok((*val).clone())
     }
 
@@ -297,7 +326,11 @@ impl RelationalDriver for PostgresDriver {
         Ok((*val).clone())
     }
 
-    async fn describe_table(&self, schema: &str, table: &str) -> Result<TableSchema, DatabaseError> {
+    async fn describe_table(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<TableSchema, DatabaseError> {
         let key = (schema.to_string(), table.to_string());
         let loader_key = key.clone();
         let metadata_ctx = self.metadata_context.clone();
@@ -360,15 +393,20 @@ impl RelationalDriver for PostgresDriver {
             parts.push(col_def);
         }
 
-        if let Ok(constraint_rows) = self.metadata_context.client.query(
-            "SELECT conname, pg_catalog.pg_get_constraintdef(oid) as definition \
+        if let Ok(constraint_rows) = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT conname, pg_catalog.pg_get_constraintdef(oid) as definition \
              FROM pg_catalog.pg_constraint \
              WHERE conrelid = (SELECT c.oid FROM pg_catalog.pg_class c \
                                JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
                                WHERE n.nspname = $1 AND c.relname = $2) \
              ORDER BY contype, conname",
-            &[&schema, &table],
-        ).await {
+                &[&schema, &table],
+            )
+            .await
+        {
             for row in constraint_rows {
                 let conname: String = row.get(0);
                 let definition: String = row.get(1);
@@ -379,15 +417,20 @@ impl RelationalDriver for PostgresDriver {
         ddl.push_str(&parts.join(",\n"));
         ddl.push_str("\n);");
 
-        if let Ok(index_rows) = self.metadata_context.client.query(
-            "SELECT pg_catalog.pg_get_indexdef(indexrelid) as indexdef \
+        if let Ok(index_rows) = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT pg_catalog.pg_get_indexdef(indexrelid) as indexdef \
              FROM pg_catalog.pg_index \
              WHERE indrelid = (SELECT c.oid FROM pg_catalog.pg_class c \
                                JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
                                WHERE n.nspname = $1 AND c.relname = $2) \
                AND NOT indisprimary",
-            &[&schema, &table],
-        ).await {
+                &[&schema, &table],
+            )
+            .await
+        {
             for row in index_rows {
                 let index_def: String = row.get(0);
                 ddl.push_str(&format!("\n\n{};", index_def));
@@ -524,14 +567,17 @@ impl RelationalDriver for PostgresDriver {
         sql: &str,
         batch_size: usize,
         offset: Option<usize>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, DatabaseError>> + Send>>, DatabaseError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<RowBatch, DatabaseError>> + Send>>, DatabaseError>
+    {
         let cancel_token = self.main_context.cancel_token();
         self.cancel_tokens
             .lock()
             .await
             .insert(query_id.to_string(), cancel_token);
 
-        let final_sql = self.get_dialect().transform_query_limit(sql, batch_size, offset);
+        let final_sql = self
+            .get_dialect()
+            .transform_query_limit(sql, batch_size, offset);
 
         let ctx = self.open_context("query").await?;
         let session = ctx.open_session("query").await?;
@@ -585,23 +631,46 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn refresh_table(&self, schema: &str, table: &str) -> Result<(), DatabaseError> {
-        self.column_cache.invalidate(&(schema.to_string(), table.to_string())).await;
+        self.column_cache
+            .invalidate(&(schema.to_string(), table.to_string()))
+            .await;
         self.graph_cache.invalidate(&schema.to_string()).await;
         Ok(())
     }
 
-    async fn get_execution_plan(&self, sql: &str, options: ExplainOptions) -> Result<PlanNode, DatabaseError> {
+    async fn get_execution_plan(
+        &self,
+        sql: &str,
+        options: ExplainOptions,
+    ) -> Result<PlanNode, DatabaseError> {
         let mut opts = vec!["FORMAT JSON"];
-        if options.analyze { opts.push("ANALYZE"); }
-        if options.verbose { opts.push("VERBOSE"); }
-        if options.costs { opts.push("COSTS"); }
-        if options.buffers { opts.push("BUFFERS"); }
-        if options.timing { opts.push("TIMING"); }
-        if options.settings { opts.push("SETTINGS"); }
+        if options.analyze {
+            opts.push("ANALYZE");
+        }
+        if options.verbose {
+            opts.push("VERBOSE");
+        }
+        if options.costs {
+            opts.push("COSTS");
+        }
+        if options.buffers {
+            opts.push("BUFFERS");
+        }
+        if options.timing {
+            opts.push("TIMING");
+        }
+        if options.settings {
+            opts.push("SETTINGS");
+        }
 
         let explain_sql = format!("EXPLAIN ({}) {}", opts.join(", "), sql);
-        let rows = self.utility_context.client.query(&explain_sql, &[]).await.map_err(map_db_error)?;
-        
+        let rows = self
+            .utility_context
+            .client
+            .query(&explain_sql, &[])
+            .await
+            .map_err(map_db_error)?;
+
         if let Some(row) = rows.first() {
             let raw_str = if let Ok(val) = row.try_get::<_, String>(0) {
                 val
@@ -612,19 +681,27 @@ impl RelationalDriver for PostgresDriver {
             } else {
                 match row.try_get::<_, types::RawValue>(0) {
                     Ok(raw_val) => {
-                        if !raw_val.0.is_empty() && raw_val.0[0] == 1 && row.columns()[0].type_().name() == "jsonb" {
+                        if !raw_val.0.is_empty()
+                            && raw_val.0[0] == 1
+                            && row.columns()[0].type_().name() == "jsonb"
+                        {
                             String::from_utf8_lossy(&raw_val.0[1..]).into_owned()
                         } else {
                             String::from_utf8_lossy(raw_val.0).into_owned()
                         }
                     }
-                    Err(e) => return Err(DatabaseError::new(format!("Failed to retrieve EXPLAIN result: {}", e))),
+                    Err(e) => {
+                        return Err(DatabaseError::new(format!(
+                            "Failed to retrieve EXPLAIN result: {}",
+                            e
+                        )))
+                    }
                 }
             };
 
             let arr: serde_json::Value = serde_json::from_str(&raw_str)
                 .map_err(|e| DatabaseError::new(format!("Failed to parse EXPLAIN JSON: {}", e)))?;
-            
+
             let plan_val = if arr.is_array() {
                 &arr[0]["Plan"]
             } else {
@@ -634,16 +711,22 @@ impl RelationalDriver for PostgresDriver {
             if plan_val.is_null() {
                 return Err(DatabaseError::new("Explain plan key not found".to_string()));
             }
-            
-            let node: PlanNode = serde_json::from_value(plan_val.clone())
-                .map_err(|e| DatabaseError::new(format!("Failed to deserialize PlanNode: {}", e)))?;
-            
+
+            let node: PlanNode = serde_json::from_value(plan_val.clone()).map_err(|e| {
+                DatabaseError::new(format!("Failed to deserialize PlanNode: {}", e))
+            })?;
+
             return Ok(node);
         }
-        Err(DatabaseError::new("Explain plan returned no results".to_string()))
+        Err(DatabaseError::new(
+            "Explain plan returned no results".to_string(),
+        ))
     }
 
-    async fn list_active_sessions(&self, show_idle: bool) -> Result<Vec<DbSessionInfo>, DatabaseError> {
+    async fn list_active_sessions(
+        &self,
+        show_idle: bool,
+    ) -> Result<Vec<DbSessionInfo>, DatabaseError> {
         let mut sql = "SELECT \
                          pid, \
                          usename::text, \
@@ -652,13 +735,19 @@ impl RelationalDriver for PostgresDriver {
                          query_start::text, \
                          client_addr::text \
                        FROM pg_catalog.pg_stat_activity \
-                       WHERE backend_type = 'client backend'".to_string();
+                       WHERE backend_type = 'client backend'"
+            .to_string();
 
         if !show_idle {
             sql.push_str(" AND (state IS NULL OR state NOT LIKE 'idle%')");
         }
 
-        let rows = self.utility_context.client.query(&sql, &[]).await.map_err(map_db_error)?;
+        let rows = self
+            .utility_context
+            .client
+            .query(&sql, &[])
+            .await
+            .map_err(map_db_error)?;
         let mut sessions = Vec::new();
         for row in rows {
             let pid: i32 = row.get(0);
@@ -696,9 +785,16 @@ impl RelationalDriver for PostgresDriver {
         Ok(())
     }
 
-    async fn list_indexes(&self, schema: &str, table: &str) -> Result<Vec<IndexInfo>, DatabaseError> {
-        let rows = self.metadata_context.client.query(
-            "SELECT c.relname as index_name, \
+    async fn list_indexes(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<IndexInfo>, DatabaseError> {
+        let rows = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT c.relname as index_name, \
                     tc.relname as table_name, \
                     i.indisunique as is_unique, \
                     i.indisprimary as is_primary, \
@@ -720,8 +816,10 @@ impl RelationalDriver for PostgresDriver {
              LEFT OUTER JOIN pg_catalog.pg_description dsc ON i.indexrelid = dsc.objoid \
              WHERE n.nspname = $1 AND tc.relname = $2 \
              ORDER BY c.relname",
-            &[&schema, &table],
-        ).await.map_err(map_db_error)?;
+                &[&schema, &table],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         let mut indexes = Vec::new();
         for row in rows {
@@ -748,9 +846,16 @@ impl RelationalDriver for PostgresDriver {
         Ok(indexes)
     }
 
-    async fn list_constraints(&self, schema: &str, table: &str) -> Result<Vec<ConstraintInfo>, DatabaseError> {
-        let rows = self.metadata_context.client.query(
-            "SELECT con.conname, \
+    async fn list_constraints(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<ConstraintInfo>, DatabaseError> {
+        let rows = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT con.conname, \
                     tc.relname as table_name, \
                     con.contype::text, \
                     pg_catalog.pg_get_constraintdef(con.oid) as definition, \
@@ -768,8 +873,10 @@ impl RelationalDriver for PostgresDriver {
              LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid = con.oid \
              WHERE n.nspname = $1 AND tc.relname = $2 \
              ORDER BY con.conname",
-            &[&schema, &table],
-        ).await.map_err(map_db_error)?;
+                &[&schema, &table],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         let mut constraints = Vec::new();
         for row in rows {
@@ -801,8 +908,11 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn list_sequences(&self, schema: &str) -> Result<Vec<SequenceInfo>, DatabaseError> {
-        let rows = self.metadata_context.client.query(
-            "SELECT c.relname as name, \
+        let rows = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT c.relname as name, \
                     n.nspname as schema, \
                     pg_catalog.format_type(s.seqtypid, null) as data_type, \
                     s.seqstart as start_value, \
@@ -816,8 +926,10 @@ impl RelationalDriver for PostgresDriver {
              LEFT OUTER JOIN pg_catalog.pg_description d ON c.oid = d.objoid \
              WHERE n.nspname = $1 \
              ORDER BY c.relname",
-            &[&schema],
-        ).await.map_err(map_db_error)?;
+                &[&schema],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         let mut sequences = Vec::new();
         for row in rows {
@@ -845,8 +957,11 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn list_procedures(&self, schema: &str) -> Result<Vec<ProcedureInfo>, DatabaseError> {
-        let rows = self.metadata_context.client.query(
-            "SELECT p.proname as name, \
+        let rows = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT p.proname as name, \
                     n.nspname as schema, \
                     pg_catalog.pg_get_function_arguments(p.oid) as argument_types_str, \
                     pg_catalog.format_type(p.prorettype, null) as return_type, \
@@ -857,8 +972,10 @@ impl RelationalDriver for PostgresDriver {
              LEFT OUTER JOIN pg_catalog.pg_description d ON p.oid = d.objoid \
              WHERE n.nspname = $1 \
              ORDER BY p.proname",
-            &[&schema],
-        ).await.map_err(map_db_error)?;
+                &[&schema],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         let mut procedures = Vec::new();
         for row in rows {
@@ -888,16 +1005,21 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn list_extensions(&self) -> Result<Vec<ExtensionInfo>, DatabaseError> {
-        let rows = self.metadata_context.client.query(
-            "SELECT e.extname as name, \
+        let rows = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT e.extname as name, \
                     e.extversion as version, \
                     n.nspname as schema, \
                     pg_catalog.obj_description(e.oid, 'pg_extension') as description \
              FROM pg_catalog.pg_extension e \
              JOIN pg_catalog.pg_namespace n ON e.extnamespace = n.oid \
              ORDER BY e.extname",
-            &[],
-        ).await.map_err(map_db_error)?;
+                &[],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         let mut extensions = Vec::new();
         for row in rows {
@@ -917,17 +1039,25 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn get_view_ddl(&self, schema: &str, view: &str) -> Result<String, DatabaseError> {
-        let rows = self.metadata_context.client.query(
-            "SELECT pg_catalog.pg_get_viewdef(c.oid, true) as definition \
+        let rows = self
+            .metadata_context
+            .client
+            .query(
+                "SELECT pg_catalog.pg_get_viewdef(c.oid, true) as definition \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid \
              WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('v', 'm')",
-            &[&schema, &view],
-        ).await.map_err(map_db_error)?;
+                &[&schema, &view],
+            )
+            .await
+            .map_err(map_db_error)?;
 
         if let Some(row) = rows.first() {
             let definition: String = row.get(0);
-            Ok(format!("CREATE OR REPLACE VIEW {}.{} AS\n{}", schema, view, definition))
+            Ok(format!(
+                "CREATE OR REPLACE VIEW {}.{} AS\n{}",
+                schema, view, definition
+            ))
         } else {
             Err(DatabaseError::new("View not found".to_string()))
         }
