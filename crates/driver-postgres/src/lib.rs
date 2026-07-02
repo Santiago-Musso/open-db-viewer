@@ -260,14 +260,20 @@ impl RelationalDriver for PostgresDriver {
     }
 
     async fn get_schema_graph(&self, schema: &str) -> Result<SchemaGraph, String> {
-        // Single query to fetch ALL tables and their columns at once (no N+1)
+        // Single query via pg_catalog to fetch ALL tables and columns (avoids information_schema privilege issues)
         let col_rows = self
             .client
             .query(
-                "SELECT table_name, column_name, data_type \
-                 FROM information_schema.columns \
-                 WHERE table_schema = $1 \
-                 ORDER BY table_name, ordinal_position",
+                "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS data_type \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON c.relnamespace = n.oid \
+                 JOIN pg_attribute a ON a.attrelid = c.oid \
+                 JOIN pg_type t ON a.atttypid = t.oid \
+                 WHERE n.nspname = $1 \
+                   AND c.relkind = 'r' \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                 ORDER BY c.relname, a.attnum",
                 &[&schema],
             )
             .await
